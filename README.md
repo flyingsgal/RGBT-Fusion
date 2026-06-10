@@ -106,9 +106,6 @@ droneVechile数据集从Dota格式转OBB格式：dataProcess/dotaToOBB.py \
 droneVechile数据集从xml格式转yolo格式： xmlToTxt.py
 
 
-# Contributing 
-Feel free to dive in! [Open an issue](https://github.com/mujianyu/TwoStream_Yolov8/issues) or submit PRs.
-
 
 # Contributors
 This project exists thanks to all the people who contribute.\
