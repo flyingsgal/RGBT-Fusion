@@ -105,9 +105,3 @@ onnx推理: detect/obbOnnxdetect.py
 droneVechile数据集从Dota格式转OBB格式：dataProcess/dotaToOBB.py \
 droneVechile数据集从xml格式转yolo格式： xmlToTxt.py
 
-
-
-# Contributors
-This project exists thanks to all the people who contribute.\
-@ [hopesala](https://github.com/hopesala) <img src="https://avatars.githubusercontent.com/u/8850257?v=4" alt="hopesala" width="50" height="50">
-
