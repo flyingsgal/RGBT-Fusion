@@ -1,0 +1,114 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# RGB-Infrared YOLOv8 with RawCueAddC
+# RawCueAddC = ADD main path + raw brightness/intensity residual cue
+
+# Parameters
+ch: 6
+nc: 5
+
+scales:
+  s: [0.33, 0.50, 1024]
+
+# YOLOv8.0 backbone
+backbone:
+  # [from, repeats, module, args]
+
+  # -----------------------------------------------------
+  # Keep raw 6-channel input and extract raw cue map
+  # input x: [B, 6, H, W]
+  # 0: raw input passthrough
+  # 1: raw cue map [B, 2, H, W], channel0=RGB brightness, channel1=IR intensity
+  # -----------------------------------------------------
+  - [-1, 1, IN, []]              # 0 raw 6-channel input
+  - [0, 1, RawCueMap, []]        # 1 raw cue map
+
+  # Split RGB / Infrared branch from raw input
+  - [0, 1, Multiin, [1]]         # 2 RGB input
+  - [0, 1, Multiin, [2]]         # 3 Infrared input
+
+  # -------------------------
+  # Visible branch
+  # -------------------------
+  - [2, 1, Conv, [32, 3, 2]]     # 4-P1/2 visible
+  - [-1, 1, Conv, [64, 3, 2]]    # 5-P2/4 visible
+  - [-1, 3, C2f, [64, True]]     # 6
+
+  # -------------------------
+  # Infrared branch
+  # -------------------------
+  - [3, 1, Conv, [32, 3, 2]]     # 7-P1/2 infrared
+  - [-1, 1, Conv, [64, 3, 2]]    # 8-P2/4 infrared
+  - [-1, 3, C2f, [64, True]]     # 9
+
+  # -------------------------
+  # P3
+  # -------------------------
+  - [6, 1, Conv, [128, 3, 2]]    # 10-P3/8 visible
+  - [9, 1, Conv, [128, 3, 2]]    # 11-P3/8 infrared
+
+  - [10, 6, C2f, [128, True]]    # 12-P3/8 visible
+  - [11, 6, C2f, [128, True]]    # 13-P3/8 infrared
+
+  # -------------------------
+  # P4
+  # -------------------------
+  - [12, 1, Conv, [256, 3, 2]]   # 14-P4/16 visible
+  - [13, 1, Conv, [256, 3, 2]]   # 15-P4/16 infrared
+
+  - [14, 6, C2f, [256, True]]    # 16-P4/16 visible
+  - [15, 6, C2f, [256, True]]    # 17-P4/16 infrared
+
+  # -------------------------
+  # P5
+  # -------------------------
+  - [16, 1, Conv, [512, 3, 2]]   # 18-P5/32 visible
+  - [17, 1, Conv, [512, 3, 2]]   # 19-P5/32 infrared
+
+  - [18, 3, C2f, [512, True]]    # 20-P5/32 visible
+  - [19, 3, C2f, [512, True]]    # 21-P5/32 infrared
+
+  - [20, 1, SPPF, [512, 5]]      # 22-P5/32 visible
+  - [21, 1, SPPF, [512, 5]]      # 23-P5/32 infrared
+
+  # =====================================================
+  # RawCueAddD fusion
+  # args: [c, small_win, large_win, gamma_init, low_thr, high_thr, smooth_s, thermal_alpha]
+  # =====================================================
+
+  # P3
+  - [[12, 13, 1], 1, RawCueAddD, [128, 4, 6, 0.05, 0.20, 0.78, 0.06, 0.60]]
+
+  # P4
+  - [[16, 17, 1], 1, RawCueAddD, [256, 4, 6, 0.05, 0.20, 0.78, 0.06, 0.60]]
+
+  # P5
+  - [[22, 23, 1], 1, RawCueAddD, [512, 4, 6, 0.05, 0.20, 0.78, 0.06, 0.60]]
+
+
+# YOLOv8.0 head
+head:
+  # FPN: P5 -> P4
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]      # 27
+  - [[-1, 25], 1, Concat, [1]]                      # 28 cat fused P4
+  - [-1, 3, C2f, [512]]                             # 29
+
+  # FPN: P4 -> P3
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]      # 30
+  - [[-1, 24], 1, Concat, [1]]                      # 31 cat fused P3
+  - [-1, 3, C2f, [256]]                             # 32 P3/8 small
+
+  # PAN: P3 -> P4
+  - [-1, 1, Conv, [256, 3, 2]]                      # 33
+  - [[-1, 29], 1, Concat, [1]]                      # 34 cat head P4
+  - [-1, 3, C2f, [512]]                             # 35 P4/16 medium
+
+  # PAN: P4 -> P5
+  - [-1, 1, Conv, [512, 3, 2]]                      # 36
+  - [[-1, 26], 1, Concat, [1]]                      # 37 cat fused P5
+  - [-1, 3, C2f, [1024]]                            # 38 P5/32 large
+
+  # HBB detection
+  - [[32, 35, 38], 1, Detect, [nc]]                 # 39 Detect(P3, P4, P5)
+
+  # OBB detection: use this line and comment the Detect line above
+  # - [[32, 35, 38], 1, OBB, [nc, 1]]               # 39 OBB(P3, P4, P5)

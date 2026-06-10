@@ -1,0 +1,70 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# RGB-Infrared YOLOv8 baseline
+
+ch: 6
+nc: 5
+
+scales:
+  s: [0.33, 0.50, 1024]
+
+backbone:
+  - [-1, 1, IN, []]          # 0
+  - [-1, 1, Multiin, [1]]    # 1 RGB
+  - [-2, 1, Multiin, [2]]    # 2 Infrared
+
+  - [1, 1, Conv, [32, 3, 2]]     # 3-P1/2 visible
+  - [-1, 1, Conv, [64, 3, 2]]    # 4-P2/4 visible
+  - [-1, 3, C2f, [64, True]]     # 5
+
+  - [2, 1, Conv, [32, 3, 2]]     # 6-P1/2 infrared
+  - [-1, 1, Conv, [64, 3, 2]]    # 7-P2/4 infrared
+  - [-1, 3, C2f, [64, True]]     # 8
+
+  - [5, 1, Conv, [128, 3, 2]]    # 9-P3/8 visible
+  - [8, 1, Conv, [128, 3, 2]]    # 10-P3/8 infrared
+  - [-2, 6, C2f, [128, True]]    # 11-P3/8 visible
+  - [-2, 6, C2f, [128, True]]    # 12-P3/8 infrared
+
+  - [-2, 1, Conv, [256, 3, 2]]   # 13-P4/16 visible
+  - [-2, 1, Conv, [256, 3, 2]]   # 14-P4/16 infrared
+  - [-2, 6, C2f, [256, True]]    # 15-P4/16 visible
+  - [-2, 6, C2f, [256, True]]    # 16-P4/16 infrared
+
+  - [-2, 1, Conv, [512, 3, 2]]   # 17-P5/32 visible
+  - [-2, 1, Conv, [512, 3, 2]]   # 18-P5/32 infrared
+  - [-2, 3, C2f, [512, True]]    # 19-P5/32 visible
+  - [-2, 3, C2f, [512, True]]    # 20-P5/32 infrared
+  - [-2, 1, SPPF, [512, 5]]      # 21-P5/32 visible
+  - [-2, 1, SPPF, [512, 5]]      # 22-P5/32 infrared
+
+  # # P3 fusion
+  - [[11, 12, 1], 1, LASCIModule, [128, 4, 6, 4, 0.35, 0.25, 0.5]]
+  # # P4 fusion
+  - [[15, 16, 1], 1, LASCIModule, [128, 4, 6, 4, 0.35, 0.25, 0.5]]
+  # # P5 fusion
+  - [[21, 22, 1], 1, LASCIModule, [128, 4, 6, 4, 0.35, 0.25, 0.5]]
+
+# YOLOv8.0 head
+head:
+  # FPN: P5 -> P4
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]      # 26 upsample fused P5
+  - [[-1, 24], 1, Concat, [1]]                      # 27 cat fused P4
+  - [-1, 3, C2f, [512]]                             # 28 P4 head
+
+  # FPN: P4 -> P3
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]      # 29
+  - [[-1, 23], 1, Concat, [1]]                      # 30 cat fused P3
+  - [-1, 3, C2f, [256]]                             # 31 P3/8 small
+
+  # PAN: P3 -> P4
+  - [-1, 1, Conv, [256, 3, 2]]                      # 32
+  - [[-1, 28], 1, Concat, [1]]                      # 33 cat head P4
+  - [-1, 3, C2f, [512]]                             # 34 P4/16 medium
+
+  # PAN: P4 -> P5
+  - [-1, 1, Conv, [512, 3, 2]]                      # 35
+  - [[-1, 25], 1, Concat, [1]]                      # 36 cat fused P5
+  - [-1, 3, C2f, [1024]]                            # 37 P5/32 large
+
+  # OBB detection
+  - [[31, 34, 37], 1, OBB, [nc, 1]]                 # 38 OBB(P3, P4, P5)
