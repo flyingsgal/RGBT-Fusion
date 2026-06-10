@@ -174,7 +174,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Robust Ultralytics YOLO Training Script")
 
     parser.add_argument("--model", type=str,
-                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/new_ACM/LASCI_add.yaml",
+                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/new_ACM/LASCI_DSSF.yaml",
                         help="模型结构 yaml 或权重 pt 路径")
     parser.add_argument("--data", type=str,
                         default="/storage/jyx4/projects/TwoStream_Yolov8-main/data/dronevehicle_obb.yaml",
@@ -187,7 +187,7 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=8)
 
     parser.add_argument("--project", type=str, default="runs/dronevehicle/obb")
-    parser.add_argument("--name", type=str, default="LASCI_add")
+    parser.add_argument("--name", type=str, default="LASCI_DSSF")
     parser.add_argument("--exist-ok", action="store_true")
 
     parser.add_argument("--resume", action="store_true")

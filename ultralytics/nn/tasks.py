@@ -108,6 +108,7 @@ from ultralytics.nn.modules import (
     DSSF_SS2D,
     CMSSMahalanobisWindowInteraction,
     LASCIModule,
+    LASCIDSSF,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1415,6 +1416,30 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 args = [c1a, c2]
             else:
                 args = [c1a, c2]
+        elif m in {LASCIDSSF}:
+            # 输入:
+            #   [rgb_feat, ir_feat, rgb_raw]
+            # 或:
+            #   [rgb_feat, ir_feat]
+            #
+            # 输出:
+            #   fused feature
+            #
+            # YAML args:
+            #   [embed_dim, small_win, large_win, num_heads, budget_ratio, softmax_tau, lambda_low]
+
+            assert isinstance(f, list) and len(f) in (2, 3), \
+                f"{m.__name__} expects [rgb, ir] or [rgb, ir, rgb_raw], got f={f}"
+
+            c1a, c1b = ch[f[0]], ch[f[1]]
+            assert c1a == c1b, \
+                f"{m.__name__} channel mismatch: rgb={c1a}, ir={c1b}"
+
+            c1 = c1a
+            c2 = c1a
+
+            # 不在 YAML 里写 c，自动由 rgb/ir 特征层推导
+            args = [c1, *args]
         #####IR引导模块####################################
         elif m is IRPromptRGB:
             # 输入是双流 tuple，输出仍然是双流 tuple

@@ -105,6 +105,7 @@ from .block import (
     DSSF_SS2D,
     CMSSMahalanobisWindowInteraction,
     LASCIModule,
+    LASCIDSSF,
 )
 from .conv import (
     CBAM,
@@ -223,4 +224,5 @@ __all__ = (
     "DSSF_SS2D",
     "CMSSMahalanobisWindowInteraction",
     "LASCIModule",
+    "LASCIDSSF",
 )

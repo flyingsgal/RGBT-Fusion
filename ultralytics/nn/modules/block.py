@@ -85,6 +85,7 @@ __all__ = (
     "DSSF_SS2D",
     "CMSSMahalanobisWindowInteraction",
     "LASCIModule",
+    "LASCIDSSF",
 )
 
 
@@ -9488,6 +9489,7 @@ class LASCIModule(nn.Module):
         rgb_raw_range=1.0,
         chunk_windows=2048,
         init_gamma=0.05,
+        return_pair=False,
     ):
         """
         Args:
@@ -9521,6 +9523,7 @@ class LASCIModule(nn.Module):
         self.low_smooth = float(low_smooth)
         self.rgb_raw_range = float(rgb_raw_range)
         self.chunk_windows = int(chunk_windows)
+        self.return_pair = return_pair
 
         # 将 RGB/IR 特征投影到跨模态相关性计算空间。
         self.rgb_in = nn.Sequential(
@@ -9874,5 +9877,65 @@ class LASCIModule(nn.Module):
         rgb_out = self.act(rgb_out + self.rgb_ffn(rgb_out))
         ir_out = self.act(ir_out + self.ir_ffn(ir_out))
 
-        # return (rgb_out, ir_out)
+        if self.return_pair:
+            return rgb_out, ir_out
         return rgb_out + ir_out
+
+class LASCIDSSF(nn.Module):
+    """
+    LA-SCI + DSSF_SS2D 包装模块。
+
+    作用：
+        1. 先用 LASCIModule 做光照感知的局部跨模态交互；
+        2. 得到增强后的 rgb_out / ir_out 两路特征；
+        3. 再用 DSSF_SS2D 做状态空间融合；
+        4. 最终输出单路 fused feature，直接送入 YOLO Neck。
+
+    这样 YAML 中不需要写：
+        - [-1, 1, DSSF_SS2D, [c]]
+
+    而是直接写：
+        - [[rgb_idx, ir_idx, raw_rgb_idx], 1, LASCIDSSF, [...]]
+    """
+
+    def __init__(
+        self,
+        c,
+        embed_dim=128,
+        small_win=4,
+        large_win=6,
+        num_heads=4,
+        budget_ratio=0.35,
+        softmax_tau=0.25,
+        lambda_low=0.5,
+    ):
+        super().__init__()
+
+        # LA-SCI 负责局部交互，必须返回双路增强特征
+        self.lasci = LASCIModule(
+            c=c,
+            embed_dim=embed_dim,
+            small_win=small_win,
+            large_win=large_win,
+            num_heads=num_heads,
+            budget_ratio=budget_ratio,
+            softmax_tau=softmax_tau,
+            lambda_low=lambda_low,
+            return_pair=True,
+        )
+
+        # DSSF_SS2D 负责状态空间融合
+        # 保持你原来的简写逻辑，本质等价于 YAML 里的 DSSF_SS2D [c]
+        self.dssf = DSSF_SS2D(c, c)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [rgb_feat, ir_feat, rgb_raw] 或 [rgb_feat, ir_feat]
+
+        Returns:
+            fused: [B, C, H, W]
+        """
+        rgb_out, ir_out = self.lasci(x)
+        fused = self.dssf([rgb_out, ir_out])
+        return fused
