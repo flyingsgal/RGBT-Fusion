@@ -1,7 +1,7 @@
 # 查看模型信息
 
 from ultralytics import YOLO
-model = YOLO('/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/new_ACM/LASCI_DSSF.yaml')
+model = YOLO('/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/offset/IRGuidedSelectiveOffset_P3.yaml')
 model.info()
 
 # from ultralytics import YOLO

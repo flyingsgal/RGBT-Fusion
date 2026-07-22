@@ -78,18 +78,6 @@ def build_model(model_path: str):
 
 def train_once(args, batch_size):
     model = build_model(args.model)
-
-
-    def print_dssf_gamma(trainer):
-        print("\n[DSSF gamma]")
-        for name, m in trainer.model.named_modules():
-            if m.__class__.__name__ == "DSSF_SS2D":
-                print(f"{name}: gamma = {m.gamma.detach().cpu().item():.6f}")
-    try:
-        model.add_callback("on_train_epoch_end", print_dssf_gamma)
-    except AttributeError:
-        model.callbacks["on_train_epoch_end"].append(print_dssf_gamma)
-
     train_kwargs = dict(
         data=args.data,
         epochs=args.epochs,
@@ -174,7 +162,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Robust Ultralytics YOLO Training Script")
 
     parser.add_argument("--model", type=str,
-                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/new_ACM/LASCI_DSSF.yaml",
+                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/new_ACM/LASCI_cos.yaml",
                         help="模型结构 yaml 或权重 pt 路径")
     parser.add_argument("--data", type=str,
                         default="/storage/jyx4/projects/TwoStream_Yolov8-main/data/dronevehicle_obb.yaml",
@@ -187,7 +175,7 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=8)
 
     parser.add_argument("--project", type=str, default="runs/dronevehicle/obb")
-    parser.add_argument("--name", type=str, default="LASCI_DSSF")
+    parser.add_argument("--name", type=str, default="LASCI_cos")
     parser.add_argument("--exist-ok", action="store_true")
 
     parser.add_argument("--resume", action="store_true")

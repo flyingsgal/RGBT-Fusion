@@ -8,6 +8,8 @@ from typing import Optional, Tuple, Union
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 __all__ = (
     "DFL",
@@ -58,7 +60,7 @@ __all__ = (
     "C2f_Invo",
     "IN",
     "Multiin",
-    "EFBlock"
+    "EFBlock",
     "LiteAlign2",
     "LiteRefine2",
     "WeightedAdd",
@@ -86,6 +88,10 @@ __all__ = (
     "CMSSMahalanobisWindowInteraction",
     "LASCIModule",
     "LASCIDSSF",
+    "LASCICECC",
+    "LASCIModulev2",
+    "LASCIModulev3",
+    "IRGuidedSelectiveOffset",
 )
 
 
@@ -9490,6 +9496,8 @@ class LASCIModule(nn.Module):
         chunk_windows=2048,
         init_gamma=0.05,
         return_pair=False,
+        debug = False,
+        last_debug = None,
     ):
         """
         Args:
@@ -9524,6 +9532,8 @@ class LASCIModule(nn.Module):
         self.rgb_raw_range = float(rgb_raw_range)
         self.chunk_windows = int(chunk_windows)
         self.return_pair = return_pair
+        self.debug = False
+        self.last_debug = None
 
         # 将 RGB/IR 特征投影到跨模态相关性计算空间。
         self.rgb_in = nn.Sequential(
@@ -9541,13 +9551,28 @@ class LASCIModule(nn.Module):
         self.rgb_norm = nn.LayerNorm(embed_dim)
         self.ir_norm = nn.LayerNorm(embed_dim)
 
-        # 三项评分 MLP：输入 [D_w, U_w, L_w]，输出窗口交互需求 s_w。
-        # 不人为固定三项之间的乘法或加法关系，而是交给 MLP 在检测监督下学习。
-        self.score_mlp = nn.Sequential(
-            nn.Linear(3, 16, bias=True),
+        # # 三项评分 MLP：输入 [D_w, U_w, L_w]，输出窗口交互需求 s_w。
+        # # 不人为固定三项之间的乘法或加法关系，而是交给 MLP 在检测监督下学习。
+        # self.score_mlp = nn.Sequential(
+        #     nn.Linear(3, 16, bias=True),
+        #     nn.SiLU(inplace=True),
+        #     nn.Linear(16, 1, bias=True),
+        # )
+
+        # 轻量窗口方向 Router：
+        # 输入当前窗口 RGB/IR 的局部特征摘要，输出两个方向的残差门控：
+        # gate_i2r: IR -> RGB
+        # gate_r2i: RGB -> IR
+        router_hidden = max(embed_dim // 4, 16)
+        self.router_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, router_hidden, bias=True),
             nn.SiLU(inplace=True),
-            nn.Linear(16, 1, bias=True),
+            nn.Linear(router_hidden, 2, bias=True),
         )
+        # 保守初始化：初始 gate = sigmoid(0) = 0.5
+        # 由于后面还有 gamma_r/gamma_i，实际残差强度仍然较小。
+        nn.init.zeros_(self.router_mlp[-1].weight)
+        nn.init.zeros_(self.router_mlp[-1].bias)
 
         # 双向局部跨模态交互。
         self.rgb_from_ir = _LASCILocalCrossAttention(embed_dim, num_heads)
@@ -9640,90 +9665,135 @@ class LASCIModule(nn.Module):
     # --------------------------------------------------------
     # 评分与软预算门控
     # --------------------------------------------------------
-    def _compute_window_score(self, rgb_small_n, ir_small_n, low_win):
+    # def _compute_window_score(self, rgb_small_n, ir_small_n, low_win):
+    #     """
+    #     计算窗口级交互需求分数。
+
+    #     Args:
+    #         rgb_small_n: [B,L,N,E]，归一化后的 RGB small windows
+    #         ir_small_n : [B,L,N,E]，归一化后的 IR small windows
+    #         low_win    : [B,L]，从 RGB 原图亮度得到的局部低光项
+
+    #     Returns:
+    #         score: [B,L]，窗口交互需求，范围 [0,1]
+    #         diff_score: [B,L]，便于后续可视化/调试
+    #         incons_score: [B,L]
+    #     """
+    #     # 1) 特征差异项 D_w：窗口内 L1 差异。
+    #     diff_score = torch.abs(rgb_small_n - ir_small_n).mean(dim=(2, 3))  # [B,L]
+    #     diff_score = _lasci_norm_01(diff_score)
+
+    #     # 2) 余弦不一致项 U_w：窗口均值向量的方向差异。
+    #     rgb_vec = rgb_small_n.mean(dim=2)  # [B,L,E]
+    #     ir_vec = ir_small_n.mean(dim=2)    # [B,L,E]
+    #     cos = F.cosine_similarity(rgb_vec, ir_vec, dim=-1, eps=1e-6)  # [-1,1]
+    #     sim01 = 0.5 * (cos + 1.0)
+    #     incons_score = 1.0 - sim01.clamp(0.0, 1.0)  # [B,L]
+
+    #     # ------------------------------------------------------------
+    #     # 3) 三项分数拼接
+    #     # diff_score   : [B, L]
+    #     # incons_score : [B, L]
+    #     # low_win      : [B, L]
+    #     # ------------------------------------------------------------
+
+    #     # 先保证 low_win 和特征统计量 dtype/device 一致
+    #     low_win = low_win.to(device=diff_score.device, dtype=diff_score.dtype)
+
+    #     score_in = torch.stack(
+    #         [diff_score, incons_score, low_win],
+    #         dim=-1
+    #     )  # [B, L, 3]
+
+    #     # ------------------------------------------------------------
+    #     # 关键修复：
+    #     # Linear 要求输入 mat1 和权重 mat2 dtype 一致。
+    #     # 验证阶段可能 model.half() 或输入 half，必须显式对齐到 MLP 权重 dtype。
+    #     # ------------------------------------------------------------
+    #     mlp_dtype = self.score_mlp[0].weight.dtype
+    #     mlp_device = self.score_mlp[0].weight.device
+
+    #     score_in = score_in.to(device=mlp_device, dtype=mlp_dtype)
+
+    #     score = torch.sigmoid(self.score_mlp(score_in)).squeeze(-1)  # [B, L]
+
+    #     # score 后面要和特征/gate 相乘，所以再转回特征 dtype
+    #     score = score.to(device=diff_score.device, dtype=diff_score.dtype)
+
+    #     return score, diff_score, incons_score
+
+    # def _soft_budget_gate(self, score, return_prob=False):
+    #     """
+    #     Soft Budget Gate：用连续门控替代 hard Top-K。
+
+    #     Args:
+    #         score: [B,L]，窗口交互需求分数
+
+    #     Returns:
+    #         gate: [B,L]，连续交互强度，范围 (0,1)
+
+    #     解释：
+    #         budget_ratio 不再表示硬选多少窗口，而表示全图窗口共享多少交互预算。
+    #         高分窗口获得更大 gate，低分窗口获得较小 gate，但不会被硬置零。
+    #     """
+    #     b, l = score.shape
+    #     # if self.budget_ratio <= 0:
+    #     #     return torch.zeros_like(score)
+    #     # if self.budget_ratio <= 1.0:
+    #     #     budget = self.budget_ratio * float(l)
+    #     # else:
+    #     #     budget = min(float(self.budget_ratio), float(l))
+    #     if self.budget_ratio <= 0:
+    #         gate = torch.zeros_like(score)
+    #         prob = torch.zeros_like(score)
+    #         return (gate, prob) if return_prob else gate
+    #     if self.budget_ratio <= 1.0:
+    #         budget = self.budget_ratio * float(l)
+    #     else:
+    #         budget = min(float(self.budget_ratio), float(l))
+
+    #     tau = max(self.softmax_tau, 1e-6)
+    #     prob = torch.softmax(score / tau, dim=1)  # [B,L]
+    #     gate = 1.0 - torch.exp(-budget * prob)    # [B,L]
+    #     # return gate
+    #     return (gate, prob) if return_prob else gate
+    def _compute_router_gate(self, rgb_small_n, ir_small_n):
         """
-        计算窗口级交互需求分数。
+        根据当前 small window 的 RGB/IR 特征生成两个方向的窗口级 gate。
 
         Args:
-            rgb_small_n: [B,L,N,E]，归一化后的 RGB small windows
-            ir_small_n : [B,L,N,E]，归一化后的 IR small windows
-            low_win    : [B,L]，从 RGB 原图亮度得到的局部低光项
+            rgb_small_n: [B,L,N,E]
+            ir_small_n : [B,L,N,E]
 
         Returns:
-            score: [B,L]，窗口交互需求，范围 [0,1]
-            diff_score: [B,L]，便于后续可视化/调试
-            incons_score: [B,L]
+            gate_i2r: [B,L]，IR -> RGB 方向残差门控
+            gate_r2i: [B,L]，RGB -> IR 方向残差门控
+            router_logits: [B,L,2]，调试用
         """
-        # 1) 特征差异项 D_w：窗口内 L1 差异。
-        diff_score = torch.abs(rgb_small_n - ir_small_n).mean(dim=(2, 3))  # [B,L]
-        diff_score = _lasci_norm_01(diff_score)
+        # 1) GAP over window tokens
+        rgb_desc = rgb_small_n.mean(dim=2)  # [B,L,E]
+        ir_desc = ir_small_n.mean(dim=2)    # [B,L,E]
 
-        # 2) 余弦不一致项 U_w：窗口均值向量的方向差异。
-        rgb_vec = rgb_small_n.mean(dim=2)  # [B,L,E]
-        ir_vec = ir_small_n.mean(dim=2)    # [B,L,E]
-        cos = F.cosine_similarity(rgb_vec, ir_vec, dim=-1, eps=1e-6)  # [-1,1]
-        sim01 = 0.5 * (cos + 1.0)
-        incons_score = 1.0 - sim01.clamp(0.0, 1.0)  # [B,L]
+        # 2) concat 当前窗口两种模态的局部描述
+        router_in = torch.cat([rgb_desc, ir_desc], dim=-1)  # [B,L,2E]
 
-        # ------------------------------------------------------------
-        # 3) 三项分数拼接
-        # diff_score   : [B, L]
-        # incons_score : [B, L]
-        # low_win      : [B, L]
-        # ------------------------------------------------------------
+        # 3) dtype/device 对齐，避免 half 验证时报错
+        mlp_dtype = self.router_mlp[0].weight.dtype
+        mlp_device = self.router_mlp[0].weight.device
 
-        # 先保证 low_win 和特征统计量 dtype/device 一致
-        low_win = low_win.to(device=diff_score.device, dtype=diff_score.dtype)
+        router_in = router_in.to(device=mlp_device, dtype=mlp_dtype)
+        router_logits = self.router_mlp(router_in)  # [B,L,2]
 
-        score_in = torch.stack(
-            [diff_score, incons_score, low_win],
-            dim=-1
-        )  # [B, L, 3]
+        # 4) sigmoid：两个方向独立开关，不做 softmax 竞争
+        gates = torch.sigmoid(router_logits)
 
-        # ------------------------------------------------------------
-        # 关键修复：
-        # Linear 要求输入 mat1 和权重 mat2 dtype 一致。
-        # 验证阶段可能 model.half() 或输入 half，必须显式对齐到 MLP 权重 dtype。
-        # ------------------------------------------------------------
-        mlp_dtype = self.score_mlp[0].weight.dtype
-        mlp_device = self.score_mlp[0].weight.device
+        gates = gates.to(device=rgb_small_n.device, dtype=rgb_small_n.dtype)
+        router_logits = router_logits.to(device=rgb_small_n.device, dtype=rgb_small_n.dtype)
 
-        score_in = score_in.to(device=mlp_device, dtype=mlp_dtype)
+        gate_i2r = gates[..., 0]  # [B,L]
+        gate_r2i = gates[..., 1]  # [B,L]
 
-        score = torch.sigmoid(self.score_mlp(score_in)).squeeze(-1)  # [B, L]
-
-        # score 后面要和特征/gate 相乘，所以再转回特征 dtype
-        score = score.to(device=diff_score.device, dtype=diff_score.dtype)
-
-        return score, diff_score, incons_score
-
-    def _soft_budget_gate(self, score):
-        """
-        Soft Budget Gate：用连续门控替代 hard Top-K。
-
-        Args:
-            score: [B,L]，窗口交互需求分数
-
-        Returns:
-            gate: [B,L]，连续交互强度，范围 (0,1)
-
-        解释：
-            budget_ratio 不再表示硬选多少窗口，而表示全图窗口共享多少交互预算。
-            高分窗口获得更大 gate，低分窗口获得较小 gate，但不会被硬置零。
-        """
-        b, l = score.shape
-        if self.budget_ratio <= 0:
-            return torch.zeros_like(score)
-
-        if self.budget_ratio <= 1.0:
-            budget = self.budget_ratio * float(l)
-        else:
-            budget = min(float(self.budget_ratio), float(l))
-
-        tau = max(self.softmax_tau, 1e-6)
-        prob = torch.softmax(score / tau, dim=1)  # [B,L]
-        gate = 1.0 - torch.exp(-budget * prob)    # [B,L]
-        return gate
+        return gate_i2r, gate_r2i, router_logits
 
     def _cross_attention_all_windows(self, q_win, kv_win, attn_module):
         """
@@ -9794,13 +9864,13 @@ class LASCIModule(nn.Module):
 
         # 3) 从 RGB 原图构造局部低光图，注意它是局部的，不是整图单一标量。
         # low_map = self._build_lowlight_map(rgb_raw, target_hw=(h, w))
-        low_map = self._build_lowlight_map(rgb_raw, target_hw=(h, w), ref_tensor=rgb_e)
-        if low_map is not None:
-            low_map, _ = _lasci_pad_to_multiple(low_map, self.small_win)
-            low_win = self._window_mean_map(low_map, self.small_win)  # [B,L]
-            low_win = low_win.to(device=rgb_e.device, dtype=rgb_e.dtype)
-        else:
-            low_win = None
+        # low_map = self._build_lowlight_map(rgb_raw, target_hw=(h, w), ref_tensor=rgb_e)
+        # if low_map is not None:
+        #     low_map, _ = _lasci_pad_to_multiple(low_map, self.small_win)
+        #     low_win = self._window_mean_map(low_map, self.small_win)  # [B,L]
+        #     low_win = low_win.to(device=rgb_e.device, dtype=rgb_e.dtype)
+        # else:
+        #     low_win = None
 
         # 4) 构建 small query windows 和 large search windows。
         rgb_small, gh, gw = _lasci_window_partition(rgb_e, self.small_win)  # [B,L,Ns,E]
@@ -9815,40 +9885,80 @@ class LASCIModule(nn.Module):
         rgb_large_n = self.rgb_norm(rgb_large)
         ir_large_n = self.ir_norm(ir_large)
 
-        # 6) 三项评分：特征差异、余弦不一致、RGB 原图局部低光。
-        score, _, _ = self._compute_window_score(rgb_small_n, ir_small_n, low_win)
+        # # 6) 三项评分：特征差异、余弦不一致、RGB 原图局部低光。
+        # # score, _, _ = self._compute_window_score(rgb_small_n, ir_small_n, low_win)
+        # score, diff_score, incons_score = self._compute_window_score(rgb_small_n, ir_small_n, low_win)
 
-        # 7) 软预算门控：所有窗口都有连续交互强度，避免 hard top-k。
-        gate = self._soft_budget_gate(score)  # [B,L]
-        gate = gate.to(device=rgb_e.device, dtype=rgb_e.dtype)
-        # 如果没有 low_win，则方向调节为 0。
-        if low_win is None:
-            low_win = torch.zeros_like(gate)
-        else:
-            low_win = low_win.to(device=gate.device, dtype=gate.dtype)
+        # # 7) 软预算门控：所有窗口都有连续交互强度，避免 hard top-k。
+        # # gate = self._soft_budget_gate(score)  # [B,L]
+        # # gate = gate.to(device=rgb_e.device, dtype=rgb_e.dtype)
+        # gate, prob = self._soft_budget_gate(score, return_prob=True)
+        # gate = gate.to(device=rgb_e.device, dtype=rgb_e.dtype)
+        # prob = prob.to(device=rgb_e.device, dtype=rgb_e.dtype)
+        # # 如果没有 low_win，则方向调节为 0。
+        # if low_win is None:
+        #     low_win = torch.zeros_like(gate)
+        # else:
+        #     low_win = low_win.to(device=gate.device, dtype=gate.dtype)
+
+        # # 6) 轻量窗口方向 router：
+        # #    不再使用 D/U/L，也不再做全图 soft budget 分配。
+        # gate_i2r, gate_r2i, router_logits = self._compute_router_gate(
+        #     rgb_small_n,
+        #     ir_small_n
+        # )
+        # gate_i2r = gate_i2r.to(device=rgb_e.device, dtype=rgb_e.dtype)
+        # gate_r2i = gate_r2i.to(device=rgb_e.device, dtype=rgb_e.dtype)
+
         # 8) 双向局部跨模态交互：
         #    RGB small -> IR large: 用 IR 补 RGB
         #    IR  small -> RGB large: 用 RGB 补 IR
+
         delta_i2r = self._cross_attention_all_windows(rgb_small_n, ir_large_n, self.rgb_from_ir)
+
         delta_r2i = self._cross_attention_all_windows(ir_small_n, rgb_large_n, self.ir_from_rgb)
 
         # 9) 低光方向调节是局部窗口级的：
         #    一张图可以局部亮、局部暗；每个窗口都有自己的 low_win。
         #    low_win 越大，越增强 IR->RGB，越抑制 RGB->IR。
-        gate_i2r = gate * (1.0 + self.lambda_low * low_win)
-        gate_r2i = gate * (1.0 - self.lambda_low * low_win).clamp(min=0.0)
-        gate_i2r = gate_i2r.unsqueeze(-1).unsqueeze(-1).to(
-            device=delta_i2r.device, dtype=delta_i2r.dtype
-        )
-        gate_r2i = gate_r2i.unsqueeze(-1).unsqueeze(-1).to(
-            device=delta_r2i.device, dtype=delta_r2i.dtype
-        )
-        delta_i2r = gate_i2r * delta_i2r
-        delta_r2i = gate_r2i * delta_r2i
+        # gate_i2r = gate * (1.0 + self.lambda_low * low_win)
+        # gate_r2i = gate * (1.0 - self.lambda_low * low_win).clamp(min=0.0)
+
+        # if getattr(self, "debug", False):
+        #     self.last_debug = {
+        #         # "D": diff_score.detach().float().cpu(),
+        #         # "U": incons_score.detach().float().cpu(),
+        #         # "L": low_win.detach().float().cpu(),
+        #         # "score": score.detach().float().cpu(),
+        #         # "prob": prob.detach().float().cpu(),
+        #         # "gate": gate.detach().float().cpu(),
+        #         # "gate_i2r": gate_i2r.detach().float().cpu(),
+        #         # "gate_r2i": gate_r2i.detach().float().cpu(),
+        #         "gate_i2r": gate_i2r.detach().float().cpu(),
+        #         "gate_r2i": gate_r2i.detach().float().cpu(),
+        #         "logit_i2r": router_logits[..., 0].detach().float().cpu(),
+        #         "logit_r2i": router_logits[..., 1].detach().float().cpu(),
+        #         "gh": gh,
+        #         "gw": gw,
+        #         "h": h,
+        #         "w": w,
+        #     }
+
+        # gate_i2r = gate_i2r.unsqueeze(-1).unsqueeze(-1).to(
+        #     device=delta_i2r.device, dtype=delta_i2r.dtype
+        # )
+        # gate_r2i = gate_r2i.unsqueeze(-1).unsqueeze(-1).to(
+        #     device=delta_r2i.device, dtype=delta_r2i.dtype
+        # )
+        # delta_i2r = gate_i2r * delta_i2r
+        # delta_r2i = gate_r2i * delta_r2i
 
         # 10) 窗口还原回特征图。
+
         delta_i2r = _lasci_window_reverse(delta_i2r, gh, gw, self.small_win)
+
         delta_r2i = _lasci_window_reverse(delta_r2i, gh, gw, self.small_win)
+
 
         # 11) 去 pad。
         delta_i2r = _lasci_remove_pad(delta_i2r, pad_hw)
@@ -9875,9 +9985,12 @@ class LASCIModule(nn.Module):
 
         # 13) 轻量 FFN 整理；仍然是双路输出，不做最终融合。
         rgb_out = self.act(rgb_out + self.rgb_ffn(rgb_out))
+        # rgb_out = rgb_res
         ir_out = self.act(ir_out + self.ir_ffn(ir_out))
 
-        if self.return_pair:
+        # if self.return_pair:
+        #     return rgb_out, ir_out
+        if getattr(self, "return_pair", False):
             return rgb_out, ir_out
         return rgb_out + ir_out
 
@@ -9939,3 +10052,1721 @@ class LASCIDSSF(nn.Module):
         rgb_out, ir_out = self.lasci(x)
         fused = self.dssf([rgb_out, ir_out])
         return fused
+
+class CECC(nn.Module):
+    """
+    CECC: Cross-modal Evidence Consistency Calibration
+    跨模态交互证据一致性校准模块
+
+    设计目标：
+    1) 不重新做 RGB/IR 融合；
+    2) 不做 Mamba / SS2D / 全局状态传播；
+    3) 只校准 LA-SCI 产生的跨模态补偿强度；
+    4) 在小窗口网格上建模“交互证据是否被邻域支持”；
+    5) 抑制孤立的错误交互，补全目标区域内断裂的交互响应。
+
+    输入:
+        rgb     : LA-SCI 输入 RGB 特征, [B,C,H,W]
+        ir      : LA-SCI 输入 IR 特征,  [B,C,H,W]
+        rgb_out : LA-SCI 输出 RGB 增强特征, [B,C,H,W]
+        ir_out  : LA-SCI 输出 IR 增强特征,  [B,C,H,W]
+
+    输出:
+        rgb_cal : CECC 校准后的 RGB 特征
+        ir_cal  : CECC 校准后的 IR 特征
+    """
+
+    def __init__(
+        self,
+        c,
+        small_win=4,
+        neigh_ks=3,
+        hidden=16,
+        eps=1e-6,
+    ):
+        super().__init__()
+        assert neigh_ks % 2 == 1, "neigh_ks should be odd, e.g. 3 or 5"
+
+        self.c = c
+        self.small_win = small_win
+        self.neigh_ks = neigh_ks
+        self.eps = eps
+
+        hidden = max(hidden, 8)
+
+        # 目标响应保护图 O:
+        # 用 fused feature 估计当前位置是否像目标区域，避免小目标孤立高交互被误杀。
+        self.obj_head = nn.Sequential(
+            nn.Conv2d(c, hidden, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, 1, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+        # 一致性权重 C:
+        # 输入为 [G, G_bar, O] 三个低维证据图。
+        self.consistency = nn.Sequential(
+            nn.Conv2d(3, hidden, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, 1, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+        # 校准强度，限制为 [0, max_alpha]，避免像 DSSF gamma 那样无界变负。
+        self.alpha_raw = nn.Parameter(torch.tensor(-6.0))
+        self.max_alpha = 0.2
+
+    @staticmethod
+    def _pad_to_multiple(x, multiple):
+        b, c, h, w = x.shape
+        pad_h = (multiple - h % multiple) % multiple
+        pad_w = (multiple - w % multiple) % multiple
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+        return x, (pad_h, pad_w)
+
+    @staticmethod
+    def _remove_pad(x, pad_hw):
+        pad_h, pad_w = pad_hw
+        if pad_h > 0:
+            x = x[:, :, :-pad_h, :]
+        if pad_w > 0:
+            x = x[:, :, :, :-pad_w]
+        return x
+
+    def _window_mean(self, x, win):
+        """
+        x: [B,1,H,W], H/W should be divisible by win
+        return: [B,1,H//win,W//win]
+        """
+        return F.avg_pool2d(x, kernel_size=win, stride=win)
+
+    def _expand_window_map(self, x_w, target_hw):
+        """
+        x_w: [B,1,Hw,Ww]
+        return: [B,1,H,W]
+        """
+        x = x_w.repeat_interleave(self.small_win, dim=2)
+        x = x.repeat_interleave(self.small_win, dim=3)
+        h, w = target_hw
+        return x[:, :, :h, :w]
+
+    def _valid_avg_pool(self, x, k):
+        """
+        对窗口证据图做 valid-neighbor normalized average。
+        避免边界 padding 0 被错误计入平均值。
+
+        x: [B,1,Hw,Ww]
+        """
+        pad = k // 2
+        return F.avg_pool2d(
+            x,
+            kernel_size=k,
+            stride=1,
+            padding=pad,
+            count_include_pad=False
+        )
+
+    def forward(self, rgb, ir, rgb_out, ir_out):
+        b, c, h, w = rgb.shape
+
+        # -------------------------------------------------
+        # 1) 得到 LA-SCI 的补偿残差
+        # -------------------------------------------------
+        delta_r = rgb_out - rgb
+        delta_i = ir_out - ir
+
+        # -------------------------------------------------
+        # 2) 从补偿残差中估计原始交互证据 G
+        #    残差越大，说明 LA-SCI 对该区域的跨模态补偿越强。
+        # -------------------------------------------------
+        evidence_map = 0.5 * (
+            delta_r.abs().mean(dim=1, keepdim=True) +
+            delta_i.abs().mean(dim=1, keepdim=True)
+        )  # [B,1,H,W]
+
+        # 归一化到 0~1，避免不同层/不同 batch 响应尺度差异过大。
+        e_min = evidence_map.amin(dim=(2, 3), keepdim=True)
+        e_max = evidence_map.amax(dim=(2, 3), keepdim=True)
+        evidence_map = (evidence_map - e_min) / (e_max - e_min + self.eps)
+
+        # -------------------------------------------------
+        # 3) 在 small-window 网格上计算 G_w
+        # -------------------------------------------------
+        evidence_pad, pad_hw = self._pad_to_multiple(evidence_map, self.small_win)
+        G_w = self._window_mean(evidence_pad, self.small_win)  # [B,1,Hw,Ww]
+
+        # -------------------------------------------------
+        # 4) 邻域证据 G_bar
+        #    K=3 表示最多看周围 8 个窗口 + 当前窗口。
+        # -------------------------------------------------
+        G_bar = self._valid_avg_pool(G_w, self.neigh_ks)
+
+        # -------------------------------------------------
+        # 5) 目标响应保护图 O_w
+        #    用 fused feature 生成目标响应，保护小目标孤立高交互。
+        # -------------------------------------------------
+        fused = rgb_out + ir_out
+        O = self.obj_head(fused)  # [B,1,H,W]
+        O_pad, _ = self._pad_to_multiple(O, self.small_win)
+        O_w = self._window_mean(O_pad, self.small_win)  # [B,1,Hw,Ww]
+
+        # -------------------------------------------------
+        # 6) 一致性权重 C_w
+        #    C 高：相信原始 LA-SCI 证据 G_w；
+        #    C 低：更多采用邻域共识 G_bar。
+        # -------------------------------------------------
+        C_w = self.consistency(torch.cat([G_w, G_bar, O_w], dim=1))
+
+        # -------------------------------------------------
+        # 7) 校准后的交互证据 G_hat_w
+        # -------------------------------------------------
+        G_hat_w = C_w * G_w + (1.0 - C_w) * G_bar
+
+        # 限制校准强度，避免彻底推翻 LA-SCI 原始证据。
+        alpha = self.max_alpha * torch.sigmoid(self.alpha_raw)
+
+        # 最终证据 = 原证据 + 小幅一致性修正
+        G_cal_w = (1.0 - alpha) * G_w + alpha * G_hat_w
+
+        # -------------------------------------------------
+        # 8) 扩展回特征图大小
+        # -------------------------------------------------
+        G_cal = self._expand_window_map(G_cal_w, target_hw=(evidence_pad.shape[2], evidence_pad.shape[3]))
+        G_cal = self._remove_pad(G_cal, pad_hw)
+        G_cal = G_cal.to(device=rgb.device, dtype=rgb.dtype)
+
+        # -------------------------------------------------
+        # 9) 用校准证据重新控制 LA-SCI 补偿残差
+        #    不直接改 fused feature，只改 LA-SCI 的 delta 强度。
+        # -------------------------------------------------
+        corr_w = torch.tanh(G_hat_w - G_w)
+        corr = self._expand_window_map(corr_w, target_hw=(evidence_pad.shape[2], evidence_pad.shape[3]))
+        corr = self._remove_pad(corr, pad_hw)
+
+        alpha = self.max_alpha * torch.sigmoid(self.alpha_raw)
+
+        rgb_cal = rgb_out + alpha * corr * delta_r
+        ir_cal  = ir_out  + alpha * corr * delta_i
+
+        return rgb_cal, ir_cal
+
+class LASCICECC(nn.Module):
+    """
+    LA-SCI + CECC 包装模块。
+
+    作用：
+        1) 先用 LASCIModule 做低光感知局部跨模态交互；
+        2) 得到 rgb_out / ir_out；
+        3) 用 CECC 校准 LA-SCI 产生的交互补偿证据；
+        4) 输出 rgb_cal + ir_cal，直接送入 YOLO Neck。
+
+    与 LASCIDSSF 的区别：
+        - LASCIDSSF: LA-SCI 后再用 DSSF_SS2D 重写融合特征；
+        - LASCICECC: LA-SCI 后只校准其补偿证据，不做全局特征重建。
+    """
+
+    def __init__(
+        self,
+        c,
+        embed_dim=128,
+        small_win=4,
+        large_win=6,
+        num_heads=4,
+        budget_ratio=0.35,
+        softmax_tau=0.25,
+        lambda_low=0.5,
+        neigh_ks=3,
+    ):
+        super().__init__()
+
+        self.lasci = LASCIModule(
+            c=c,
+            embed_dim=embed_dim,
+            small_win=small_win,
+            large_win=large_win,
+            num_heads=num_heads,
+            budget_ratio=budget_ratio,
+            softmax_tau=softmax_tau,
+            lambda_low=lambda_low,
+            return_pair=True,
+        )
+
+        self.cecc = CECC(
+            c=c,
+            small_win=small_win,
+            neigh_ks=neigh_ks,
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: [rgb_feat, ir_feat, rgb_raw] 或 [rgb_feat, ir_feat]
+
+        Returns:
+            fused: [B,C,H,W]
+        """
+        rgb, ir = x[0], x[1]
+
+        rgb_out, ir_out = self.lasci(x)
+
+        rgb_cal, ir_cal = self.cecc(
+            rgb=rgb,
+            ir=ir,
+            rgb_out=rgb_out,
+            ir_out=ir_out
+        )
+
+        fused = rgb_cal + ir_cal
+        return fused
+
+class LASCIModulev2(nn.Module):
+    """
+    mask guidance
+    """
+
+    def __init__(
+        self,
+        c,
+        embed_dim=128,
+        small_win=4,
+        large_win=6,
+        num_heads=4,
+        budget_ratio=0.35,
+        softmax_tau=0.25,
+        lambda_low=0.5,
+        low_thr=100.0 / 255.0,
+        low_smooth=0.08,
+        rgb_raw_range=1.0,
+        chunk_windows=2048,
+        init_gamma=0.05,
+        return_pair=False,
+        debug = False,
+        last_debug = None,
+        use_mask_guidance =True,
+    ):
+        """
+        Args:
+            c: 输入 RGB/IR 特征通道数。
+            embed_dim: 局部相关性计算空间维度。
+            small_win: 当前模态 Query 小窗口大小。
+            large_win: 另一模态 Key/Value 搜索大窗口大小。
+            num_heads: 局部跨模态注意力头数。
+            budget_ratio: 软交互预算比例；不是 hard top-k 比例。
+                          例如 0.35 表示全图窗口共享约 35% 的交互预算。
+            softmax_tau: soft budget 的温度；越小越集中，越大越平均。
+            lambda_low: 低光方向调节强度；低光越强，越增强 IR->RGB，越抑制 RGB->IR。
+            low_thr: RGB 亮度低光阈值，默认约 100/255。
+            low_smooth: 低光 soft threshold 的平滑系数。
+            rgb_raw_range: rgb_raw 的取值范围。YOLO 中通常为 1.0；如果输入 0~255，设为 255.0。
+            chunk_windows: 所有窗口做 attention 时的分块大小，用于控制显存。
+            init_gamma: 残差回写强度初值。设小一点可避免训练初期破坏 baseline。
+        """
+        super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        assert large_win >= small_win, "large_win should be >= small_win"
+
+        self.c = c
+        self.embed_dim = embed_dim
+        self.small_win = small_win
+        self.large_win = large_win
+        self.budget_ratio = float(budget_ratio)
+        self.softmax_tau = float(softmax_tau)
+        self.lambda_low = float(lambda_low)
+        self.low_thr = float(low_thr)
+        self.low_smooth = float(low_smooth)
+        self.rgb_raw_range = float(rgb_raw_range)
+        self.chunk_windows = int(chunk_windows)
+        self.return_pair = return_pair
+        self.debug = bool(debug)
+        self.last_debug = None
+
+        #mask guidance
+        self.use_mask_guidance = bool(use_mask_guidance)
+        self.cache_aux_mask_logits = False
+        self.last_mask_logits = None
+        mask_hidden = max(embed_dim // 4, 16)
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(embed_dim * 2, mask_hidden, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mask_hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(mask_hidden, mask_hidden, kernel_size=3, padding=1, groups=mask_hidden, bias=False),
+            nn.BatchNorm2d(mask_hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(mask_hidden, 1, kernel_size=1, bias=True),
+        )
+        # query modulation strength，初始非常小，避免一开始破坏原 LA-SCI
+        self.mask_alpha_raw = nn.Parameter(torch.tensor(-6.0))
+        self.mask_alpha_max = 0.5
+        # loss.py 会读取这个
+        self.last_mask_logits = None
+
+        # 将 RGB/IR 特征投影到跨模态相关性计算空间。
+        self.rgb_in = nn.Sequential(
+            nn.Conv2d(c, embed_dim, 1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.ir_in = nn.Sequential(
+            nn.Conv2d(c, embed_dim, 1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.SiLU(inplace=True),
+        )
+
+        # token 级归一化，稳定窗口内 attention 与分数计算。
+        self.rgb_norm = nn.LayerNorm(embed_dim)
+        self.ir_norm = nn.LayerNorm(embed_dim)
+
+        # 双向局部跨模态交互。
+        self.rgb_from_ir = _LASCILocalCrossAttention(embed_dim, num_heads)
+        self.ir_from_rgb = _LASCILocalCrossAttention(embed_dim, num_heads)
+
+        # 将 embed_dim 空间的更新量投影回原通道数 c。
+        self.rgb_out = nn.Sequential(
+            nn.Conv2d(embed_dim, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+        self.ir_out = nn.Sequential(
+            nn.Conv2d(embed_dim, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+
+        # 残差强度。给一个较小初值，既允许分支获得梯度，又不至于一开始破坏原特征。
+        self.gamma_r = nn.Parameter(torch.tensor(float(init_gamma)))
+        self.gamma_i = nn.Parameter(torch.tensor(float(init_gamma)))
+
+        # 输出后轻量稳定层。不是融合，只是对双路各自做局部整理。
+        self.rgb_ffn = nn.Sequential(
+            nn.Conv2d(c, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+        self.ir_ffn = nn.Sequential(
+            nn.Conv2d(c, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+
+        self.act = nn.SiLU(inplace=True)
+
+    # --------------------------------------------------------
+    # 亮度与低光项
+    # --------------------------------------------------------
+    def _build_lowlight_map(self, rgb_raw, target_hw, ref_tensor=None):
+        """
+        从 RGB 原图构造低光退化图，而不是从特征响应估计低光。
+
+        Args:
+            rgb_raw: [B,3,H0,W0]，RGB 原图，建议范围 [0,1]
+            target_hw: 当前特征层大小 (H,W)
+            ref_tensor: 用于对齐 device / dtype 的参考张量，一般传 rgb_e
+
+        Returns:
+            low_map: [B,1,H,W]，局部越暗越接近 1
+        """
+        if rgb_raw is None:
+            return None
+
+        # 关键：不要 rgb_raw.float()
+        # 验证时模型可能是 half，必须让 low_map 和特征 dtype 一致
+        if ref_tensor is not None:
+            rgb = rgb_raw.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        else:
+            rgb = rgb_raw
+
+        # 如果输入是 0~255，用户应设置 rgb_raw_range=255.0
+        if self.rgb_raw_range != 1.0:
+            rgb = rgb / self.rgb_raw_range
+
+        rgb = rgb.clamp(0.0, 1.0)
+
+        # RGB -> luma，使用同 dtype 计算
+        y = 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+
+        # resize 到当前特征层大小
+        y = F.interpolate(y, size=target_hw, mode="bilinear", align_corners=False)
+
+        # soft low-light
+        low_thr = y.new_tensor(self.low_thr)
+        low_smooth = max(self.low_smooth, 1e-6)
+        low_map = torch.sigmoid((low_thr - y) / low_smooth)
+
+        return low_map
+
+    @staticmethod
+    def _window_mean_map(x, small_win):
+        """
+        将 [B,1,H,W] 的 map 池化成窗口级 [B,L]。
+        H/W 必须能被 small_win 整除。
+        """
+        return F.avg_pool2d(x, kernel_size=small_win, stride=small_win).flatten(1)
+
+    def _compute_router_gate(self, rgb_small_n, ir_small_n):
+        """
+        根据当前 small window 的 RGB/IR 特征生成两个方向的窗口级 gate。
+
+        Args:
+            rgb_small_n: [B,L,N,E]
+            ir_small_n : [B,L,N,E]
+
+        Returns:
+            gate_i2r: [B,L]，IR -> RGB 方向残差门控
+            gate_r2i: [B,L]，RGB -> IR 方向残差门控
+            router_logits: [B,L,2]，调试用
+        """
+        # 1) GAP over window tokens
+        rgb_desc = rgb_small_n.mean(dim=2)  # [B,L,E]
+        ir_desc = ir_small_n.mean(dim=2)    # [B,L,E]
+
+        # 2) concat 当前窗口两种模态的局部描述
+        router_in = torch.cat([rgb_desc, ir_desc], dim=-1)  # [B,L,2E]
+
+        # 3) dtype/device 对齐，避免 half 验证时报错
+        mlp_dtype = self.router_mlp[0].weight.dtype
+        mlp_device = self.router_mlp[0].weight.device
+
+        router_in = router_in.to(device=mlp_device, dtype=mlp_dtype)
+        router_logits = self.router_mlp(router_in)  # [B,L,2]
+
+        # 4) sigmoid：两个方向独立开关，不做 softmax 竞争
+        gates = torch.sigmoid(router_logits)
+
+        gates = gates.to(device=rgb_small_n.device, dtype=rgb_small_n.dtype)
+        router_logits = router_logits.to(device=rgb_small_n.device, dtype=rgb_small_n.dtype)
+
+        gate_i2r = gates[..., 0]  # [B,L]
+        gate_r2i = gates[..., 1]  # [B,L]
+
+        return gate_i2r, gate_r2i, router_logits
+
+    def _cross_attention_all_windows(self, q_win, kv_win, attn_module):
+        """
+        所有窗口都做局部跨模态 attention，但用 chunk 控制显存。
+
+        Args:
+            q_win: [B,L,Nq,E]
+            kv_win: [B,L,Nk,E]
+            attn_module: _LASCILocalCrossAttention
+
+        Returns:
+            out: [B,L,Nq,E]
+        """
+        b, l, nq, e = q_win.shape
+        nk = kv_win.shape[2]
+
+        q_flat = q_win.reshape(b * l, nq, e)
+        kv_flat = kv_win.reshape(b * l, nk, e)
+
+        outs = []
+        total = q_flat.shape[0]
+        chunk = max(1, self.chunk_windows)
+        for st in range(0, total, chunk):
+            ed = min(st + chunk, total)
+            outs.append(attn_module(q_flat[st:ed], kv_flat[st:ed]))
+
+        out = torch.cat(outs, dim=0)
+        return out.view(b, l, nq, e)
+
+    # --------------------------------------------------------
+    # Forward
+    # --------------------------------------------------------
+    def forward(self, x):
+        """
+        Args:
+            x: [rgb_feat, ir_feat, rgb_raw] 或 [rgb_feat, ir_feat]
+
+        Returns:
+            (rgb_out, ir_out)
+        """
+        if not isinstance(x, (list, tuple)):
+            raise TypeError(f"LASCIModule expects list/tuple input, got {type(x)}")
+
+        if len(x) == 3:
+            rgb, ir, rgb_raw = x[0], x[1], x[2]
+            ir = ir.to(device=rgb.device, dtype=rgb.dtype)
+            rgb_raw = rgb_raw.to(device=rgb.device, dtype=rgb.dtype)
+        elif len(x) == 2:
+            rgb, ir = x[0], x[1]
+            rgb_raw = None
+        else:
+            raise ValueError(f"LASCIModule expects [rgb, ir] or [rgb, ir, rgb_raw], got len={len(x)}")
+
+        assert rgb.shape == ir.shape, f"rgb and ir feature shapes must match, got {rgb.shape} vs {ir.shape}"
+
+        rgb_res, ir_res = rgb, ir
+        b, c, h0, w0 = rgb.shape
+
+        # 1) 投影到相关性空间。
+        rgb_e = self.rgb_in(rgb)
+        ir_e = self.ir_in(ir)
+
+        if self.use_mask_guidance:
+            # 第一版建议 detach 输入，避免 mask loss 直接扰动主干/embedding
+            mask_in = torch.cat([rgb_e.detach(), ir_e.detach()], dim=1)
+
+            mask_in = mask_in.to(
+                device=self.mask_head[0].weight.device,
+                dtype=self.mask_head[0].weight.dtype
+            )
+
+            mask_logits = self.mask_head(mask_in)
+
+            #默认不缓存，避免 model.info / EMA deepcopy / validation 阶段残留计算图
+            self.last_mask_logits = None
+            if (
+                self.cache_aux_mask_logits
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                self.last_mask_logits = mask_logits
+
+            # 用于 query modulation
+            mask_prob = torch.sigmoid(mask_logits)
+            mask_prob = mask_prob.to(device=rgb_e.device, dtype=rgb_e.dtype)
+        else:
+            self.last_mask_logits = None
+            mask_prob = None
+
+        # 2) pad 到 small_win 的整数倍。
+        rgb_e, pad_hw = _lasci_pad_to_multiple(rgb_e, self.small_win)
+        ir_e, _ = _lasci_pad_to_multiple(ir_e, self.small_win)
+        if mask_prob is not None:
+            mask_prob, _ = _lasci_pad_to_multiple(mask_prob, self.small_win)
+
+        _, _, h, w = rgb_e.shape
+
+        # 3) 从 RGB 原图构造局部低光图，注意它是局部的，不是整图单一标量。
+
+        # 4) 构建 small query windows 和 large search windows。
+        rgb_small, gh, gw = _lasci_window_partition(rgb_e, self.small_win)  # [B,L,Ns,E]
+        ir_small, _, _ = _lasci_window_partition(ir_e, self.small_win)
+        if mask_prob is not None:
+            mask_small, _, _ = _lasci_window_partition(mask_prob, self.small_win)
+            # mask_small: [B, L, small_win*small_win, 1]
+        else:
+            mask_small = None
+
+        rgb_large = _lasci_extract_large_windows(rgb_e, self.small_win, self.large_win)  # [B,L,Nl,E]
+        ir_large = _lasci_extract_large_windows(ir_e, self.small_win, self.large_win)
+
+        # 5) LayerNorm 后计算分数和 attention。
+        rgb_small_n = self.rgb_norm(rgb_small)
+        ir_small_n = self.ir_norm(ir_small)
+        rgb_large_n = self.rgb_norm(rgb_large)
+        ir_large_n = self.ir_norm(ir_large)
+
+        # # 6) 三项评分：特征差异、余弦不一致、RGB 原图局部低光。
+
+        # 8) 双向局部跨模态交互：
+        #    RGB small -> IR large: 用 IR 补 RGB
+        #    IR  small -> RGB large: 用 RGB 补 IR
+        rgb_q = rgb_small_n
+        ir_q = ir_small_n
+        if mask_small is not None:
+            alpha = self.mask_alpha_max * torch.sigmoid(self.mask_alpha_raw)
+            alpha = alpha.to(device=rgb_small_n.device, dtype=rgb_small_n.dtype)
+            mask_small = mask_small.to(device=rgb_small_n.device, dtype=rgb_small_n.dtype)
+            # residual-style query modulation
+            rgb_q = rgb_small_n * (1.0 + alpha * mask_small)
+            ir_q = ir_small_n * (1.0 + alpha * mask_small)
+        delta_i2r = self._cross_attention_all_windows(
+            rgb_q,
+            ir_large_n,
+            self.rgb_from_ir
+        )
+        delta_r2i = self._cross_attention_all_windows(
+            ir_q,
+            rgb_large_n,
+            self.ir_from_rgb
+        )
+
+        # 9) 低光方向调节是局部窗口级的：
+
+        # 10) 窗口还原回特征图。
+        delta_i2r = _lasci_window_reverse(delta_i2r, gh, gw, self.small_win)
+        delta_r2i = _lasci_window_reverse(delta_r2i, gh, gw, self.small_win)
+
+        # 11) 去 pad。
+        delta_i2r = _lasci_remove_pad(delta_i2r, pad_hw)
+        delta_r2i = _lasci_remove_pad(delta_r2i, pad_hw)
+
+        # 12) 投影回原通道，并以残差形式回写。
+        # 保险：Conv/BN 权重可能是 half，输入必须对齐
+        delta_i2r = delta_i2r.to(
+            device=self.rgb_out[0].weight.device,
+            dtype=self.rgb_out[0].weight.dtype
+        )
+        delta_r2i = delta_r2i.to(
+            device=self.ir_out[0].weight.device,
+            dtype=self.ir_out[0].weight.dtype
+        )
+        delta_i2r = self.rgb_out(delta_i2r)
+        delta_r2i = self.ir_out(delta_r2i)
+
+        delta_i2r = delta_i2r.to(device=rgb_res.device, dtype=rgb_res.dtype)
+        delta_r2i = delta_r2i.to(device=ir_res.device, dtype=ir_res.dtype)
+
+        rgb_out = rgb_res + self.gamma_r.to(dtype=rgb_res.dtype) * delta_i2r
+        ir_out = ir_res + self.gamma_i.to(dtype=ir_res.dtype) * delta_r2i
+
+        # 13) 轻量 FFN 整理；仍然是双路输出，不做最终融合。
+        rgb_out = self.act(rgb_out + self.rgb_ffn(rgb_out))
+        ir_out = self.act(ir_out + self.ir_ffn(ir_out))
+
+        # if self.return_pair:
+        #     return rgb_out, ir_out
+        if getattr(self, "return_pair", False):
+            return rgb_out, ir_out
+        return rgb_out + ir_out
+
+
+# ============================================================
+# Reconstructed LA-SCI
+#
+# Core behavior:
+#   1) IR 3*3 center window is the spatial reference.
+#   2) A paired RGB 5*5 region is unfolded into nine overlapping
+#      3*3 candidates: center plus eight one-token shifts.
+#   3) The routing score is
+#          best non-center cosine - center cosine.
+#   4) A threshold selects expanded 5*5 interaction. The selected
+#      ratio is bounded per image and per feature scale.
+#   5) Unselected windows still use center 3*3 interaction.
+#   6) One shared spatial mask controls both directions, while the
+#      two cross-attention modules keep independent Q/K/V weights.
+#   7) RGB luminance only modulates the two residual directions.
+# ============================================================
+
+
+def _lasci_extract_shifted_candidates(large_windows, small_win, large_win):
+    """Split each large window into center + eight shifted small candidates.
+
+    Args:
+        large_windows: [B, L, large_win*large_win, C]
+        small_win: candidate side length
+        large_win: search-region side length
+
+    Returns:
+        candidates: [B, L, 9, small_win*small_win, C]
+
+    For the reconstructed first version, large_win must equal
+    small_win + 2. With small_win=3 and large_win=5, a stride-1
+    unfold produces the nine offsets in row-major order:
+        0 1 2
+        3 4 5
+        6 7 8
+    Candidate 4 is the center candidate.
+    """
+    if large_win != small_win + 2:
+        raise ValueError(
+            f"nine-candidate routing requires large_win=small_win+2, "
+            f"got small_win={small_win}, large_win={large_win}"
+        )
+
+    b, l, n, c = large_windows.shape
+    if n != large_win * large_win:
+        raise ValueError(
+            f"large window token count {n} does not match {large_win}*{large_win}"
+        )
+
+    grid = large_windows.view(b, l, large_win, large_win, c)
+    grid = grid.permute(0, 1, 4, 2, 3).contiguous()
+    grid = grid.view(b * l, c, large_win, large_win)
+
+    patches = F.unfold(grid, kernel_size=small_win, stride=1)
+    num_candidates = patches.shape[-1]
+    if num_candidates != 9:
+        raise RuntimeError(f"expected 9 shifted candidates, got {num_candidates}")
+
+    patches = patches.transpose(1, 2).contiguous()
+    patches = patches.view(
+        b * l,
+        num_candidates,
+        c,
+        small_win * small_win,
+    )
+    patches = patches.permute(0, 1, 3, 2).contiguous()
+    return patches.view(
+        b,
+        l,
+        num_candidates,
+        small_win * small_win,
+        c,
+    )
+
+
+def _lasci_candidate_valid_mask(gh, gw, device):
+    """Return [L,9] validity for one-token shifted candidates.
+
+    Outward shifts at the outermost feature boundary are invalid and
+    must not win because of replicated padding.
+    """
+    offsets = (
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),  (0, 0),  (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    )
+    rows = torch.arange(gh, device=device).view(gh, 1).expand(gh, gw)
+    cols = torch.arange(gw, device=device).view(1, gw).expand(gh, gw)
+    valid = []
+    for dy, dx in offsets:
+        valid.append(
+            (rows + dy >= 0)
+            & (rows + dy < gh)
+            & (cols + dx >= 0)
+            & (cols + dx < gw)
+        )
+    return torch.stack(valid, dim=-1).view(gh * gw, 9)
+
+class LASCIModulev3(nn.Module):
+    """IR-referenced adaptive local cross-modal interaction.
+
+    The range decision is asymmetric: an IR center window compares
+    against nine RGB candidates. The evidence transfer remains
+    bidirectional, with independent attention parameters.
+    """
+
+    def __init__(
+        self,
+        c,
+        embed_dim=128,
+        small_win=3,
+        large_win=5,
+        num_heads=4,
+        sim_threshold=0.05,
+        min_ratio=0.0,
+        max_ratio=0.35,
+        lambda_low=0.5,
+        low_thr=100.0 / 255.0,
+        low_smooth=0.08,
+        rgb_raw_range=1.0,
+        chunk_windows=2048,
+        init_gamma=0.05,
+        return_pair=False,
+        debug=False,
+    ):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim={embed_dim} must be divisible by num_heads={num_heads}"
+            )
+        if large_win != small_win + 2:
+            raise ValueError(
+                "the nine-candidate version requires large_win=small_win+2"
+            )
+        if not 0.0 <= min_ratio <= 1.0:
+            raise ValueError(f"min_ratio must be in [0,1], got {min_ratio}")
+        if not 0.0 <= max_ratio <= 1.0:
+            raise ValueError(f"max_ratio must be in [0,1], got {max_ratio}")
+        if min_ratio > max_ratio:
+            raise ValueError(
+                f"min_ratio={min_ratio} cannot exceed max_ratio={max_ratio}"
+            )
+
+        self.c = int(c)
+        self.embed_dim = int(embed_dim)
+        self.small_win = int(small_win)
+        self.large_win = int(large_win)
+        self.num_heads = int(num_heads)
+        self.sim_threshold = float(sim_threshold)
+        self.min_ratio = float(min_ratio)
+        self.max_ratio = float(max_ratio)
+        self.lambda_low = float(lambda_low)
+        self.low_thr = float(low_thr)
+        self.low_smooth = float(low_smooth)
+        self.rgb_raw_range = float(rgb_raw_range)
+        self.chunk_windows = int(chunk_windows)
+        self.return_pair = bool(return_pair)
+        self.debug = bool(debug)
+        self.last_debug = None
+
+        self.rgb_in = nn.Sequential(
+            nn.Conv2d(c, embed_dim, 1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.ir_in = nn.Sequential(
+            nn.Conv2d(c, embed_dim, 1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.rgb_norm = nn.LayerNorm(embed_dim)
+        self.ir_norm = nn.LayerNorm(embed_dim)
+
+        # rgb_from_ir: RGB query, IR key/value
+        # ir_from_rgb: IR query, RGB key/value
+        self.rgb_from_ir = _LASCILocalCrossAttention(embed_dim, num_heads)
+        self.ir_from_rgb = _LASCILocalCrossAttention(embed_dim, num_heads)
+
+        self.rgb_out = nn.Sequential(
+            nn.Conv2d(embed_dim, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+        self.ir_out = nn.Sequential(
+            nn.Conv2d(embed_dim, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+
+        self.gamma_r = nn.Parameter(torch.tensor(float(init_gamma)))
+        self.gamma_i = nn.Parameter(torch.tensor(float(init_gamma)))
+
+        self.rgb_ffn = nn.Sequential(
+            nn.Conv2d(c, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+        self.ir_ffn = nn.Sequential(
+            nn.Conv2d(c, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+        self.act = nn.SiLU(inplace=True)
+
+    def _build_lowlight_map(self, rgb_raw, target_hw, ref_tensor):
+        """Build local RGB low-light intensity in [0,1]."""
+        if rgb_raw is None:
+            return None
+
+        rgb = rgb_raw.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        if rgb.shape[1] < 3:
+            raise ValueError(
+                f"rgb_raw must contain at least 3 channels, got {rgb.shape}"
+            )
+        rgb = rgb[:, :3]
+        if self.rgb_raw_range != 1.0:
+            rgb = rgb / self.rgb_raw_range
+        rgb = rgb.clamp(0.0, 1.0)
+
+        # Keep the coefficients and parameters of the validated legacy branch.
+        y = (
+            0.299 * rgb[:, 0:1]
+            + 0.587 * rgb[:, 1:2]
+            + 0.114 * rgb[:, 2:3]
+        )
+        y = F.interpolate(
+            y,
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        )
+        low_smooth = max(self.low_smooth, 1e-6)
+        return torch.sigmoid((self.low_thr - y) / low_smooth)
+
+    def _compute_shared_route(
+        self,
+        ir_small_n,
+        rgb_candidates_n,
+        gh,
+        gw,
+    ):
+        """Compute IR-reference routing from raw cosine margins.
+
+        Similarity is measured in the learned Q/K space of the
+        IR-query/RGB-key attention direction. This avoids comparing
+        two independently projected modality vectors directly.
+        """
+        with torch.no_grad():
+            ir_proto = ir_small_n.mean(dim=2)
+            rgb_proto = rgb_candidates_n.mean(dim=3)
+
+            q = self.ir_from_rgb.q_proj(ir_proto)
+            k = self.ir_from_rgb.k_proj(rgb_proto)
+            q = F.normalize(q, p=2, dim=-1, eps=1e-6)
+            k = F.normalize(k, p=2, dim=-1, eps=1e-6)
+            similarities = (q.unsqueeze(2) * k).sum(dim=-1)
+
+            valid = _lasci_candidate_valid_mask(
+                gh,
+                gw,
+                device=similarities.device,
+            )
+            similarities = similarities.masked_fill(
+                ~valid.unsqueeze(0),
+                float("-inf"),
+            )
+
+            center_similarity = similarities[:, :, 4]
+            noncenter_indices = similarities.new_tensor(
+                [0, 1, 2, 3, 5, 6, 7, 8],
+                dtype=torch.long,
+            )
+            noncenter = similarities.index_select(2, noncenter_indices)
+            best_noncenter, best_local_index = noncenter.max(dim=2)
+            best_candidate_index = noncenter_indices[best_local_index]
+            score = best_noncenter - center_similarity
+            route_mask = self._bounded_threshold_mask(score)
+
+        return (
+            route_mask,
+            score,
+            center_similarity,
+            best_noncenter,
+            best_candidate_index,
+        )
+
+    def _bounded_threshold_mask(self, score):
+        """Threshold then enforce per-image lower/upper ratio bounds."""
+        b, l = score.shape
+        masks = []
+        max_count = int(math.floor(self.max_ratio * l))
+        min_count = int(math.ceil(self.min_ratio * l))
+        max_count = max(0, min(l, max_count))
+        min_count = max(0, min(max_count, min_count))
+
+        for batch_index in range(b):
+            score_b = score[batch_index]
+            finite = torch.isfinite(score_b)
+            mask_b = finite & (score_b > self.sim_threshold)
+            count = int(mask_b.sum().item())
+
+            order = torch.argsort(score_b, descending=True)
+            order = order[finite[order]]
+
+            if count > max_count:
+                mask_b = torch.zeros_like(mask_b)
+                if max_count > 0:
+                    mask_b[order[:max_count]] = True
+            elif count < min_count:
+                mask_b = torch.zeros_like(mask_b)
+                if min_count > 0:
+                    mask_b[order[:min_count]] = True
+
+            masks.append(mask_b)
+
+        return torch.stack(masks, dim=0)
+
+    def _attention_in_chunks(self, q_flat, kv_flat, attn_module):
+        if q_flat.shape[0] == 0:
+            return q_flat
+        outputs = []
+        chunk = max(1, self.chunk_windows)
+        for start in range(0, q_flat.shape[0], chunk):
+            end = min(start + chunk, q_flat.shape[0])
+            outputs.append(attn_module(q_flat[start:end], kv_flat[start:end]))
+        return torch.cat(outputs, dim=0)
+
+    def _routed_cross_attention(
+        self,
+        q_windows,
+        center_kv_windows,
+        large_kv_windows,
+        route_mask,
+        attn_module,
+    ):
+        """Use 3*3 K/V for unselected and 5*5 K/V for selected windows."""
+        b, l, nq, e = q_windows.shape
+        q_flat = q_windows.reshape(b * l, nq, e)
+        center_flat = center_kv_windows.reshape(
+            b * l,
+            center_kv_windows.shape[2],
+            e,
+        )
+        large_flat = large_kv_windows.reshape(
+            b * l,
+            large_kv_windows.shape[2],
+            e,
+        )
+        mask_flat = route_mask.reshape(b * l)
+
+        # Under AMP, LayerNorm/query tensors may remain float32 while
+        # Linear/attention outputs are autocast to float16. Index writes
+        # require an exact dtype match, so every routed branch is cast
+        # back to the query/output dtype before index_copy.
+        output_flat = torch.zeros_like(q_flat)
+        center_indices = torch.nonzero(~mask_flat, as_tuple=False).flatten()
+        large_indices = torch.nonzero(mask_flat, as_tuple=False).flatten()
+
+        if center_indices.numel() > 0:
+            center_output = self._attention_in_chunks(
+                q_flat.index_select(0, center_indices),
+                center_flat.index_select(0, center_indices),
+                attn_module,
+            )
+            center_output = center_output.to(
+                device=output_flat.device,
+                dtype=output_flat.dtype,
+            )
+            output_flat = output_flat.index_copy(
+                0,
+                center_indices,
+                center_output,
+            )
+        if large_indices.numel() > 0:
+            large_output = self._attention_in_chunks(
+                q_flat.index_select(0, large_indices),
+                large_flat.index_select(0, large_indices),
+                attn_module,
+            )
+            large_output = large_output.to(
+                device=output_flat.device,
+                dtype=output_flat.dtype,
+            )
+            output_flat = output_flat.index_copy(
+                0,
+                large_indices,
+                large_output,
+            )
+        return output_flat.view(b, l, nq, e)
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)):
+            raise TypeError(
+                f"LASCIModule expects list/tuple input, got {type(x)}"
+            )
+        if len(x) == 3:
+            rgb, ir, rgb_raw = x
+            ir = ir.to(device=rgb.device, dtype=rgb.dtype)
+            rgb_raw = rgb_raw.to(device=rgb.device, dtype=rgb.dtype)
+        elif len(x) == 2:
+            rgb, ir = x
+            ir = ir.to(device=rgb.device, dtype=rgb.dtype)
+            rgb_raw = None
+        else:
+            raise ValueError(
+                "LASCIModule expects [rgb, ir] or [rgb, ir, rgb_raw]"
+            )
+        if rgb.shape != ir.shape:
+            raise ValueError(
+                f"rgb and ir feature shapes must match, got "
+                f"{rgb.shape} vs {ir.shape}"
+            )
+
+        rgb_res, ir_res = rgb, ir
+        _, _, h0, w0 = rgb.shape
+
+        rgb_e = self.rgb_in(rgb)
+        ir_e = self.ir_in(ir)
+        rgb_e, pad_hw = _lasci_pad_to_multiple(rgb_e, self.small_win)
+        ir_e, _ = _lasci_pad_to_multiple(ir_e, self.small_win)
+
+        rgb_small, gh, gw = _lasci_window_partition(
+            rgb_e,
+            self.small_win,
+        )
+        ir_small, _, _ = _lasci_window_partition(
+            ir_e,
+            self.small_win,
+        )
+        rgb_large = _lasci_extract_large_windows(
+            rgb_e,
+            self.small_win,
+            self.large_win,
+        )
+        ir_large = _lasci_extract_large_windows(
+            ir_e,
+            self.small_win,
+            self.large_win,
+        )
+
+        rgb_small_n = self.rgb_norm(rgb_small)
+        ir_small_n = self.ir_norm(ir_small)
+        rgb_large_n = self.rgb_norm(rgb_large)
+        ir_large_n = self.ir_norm(ir_large)
+
+        rgb_candidates_n = _lasci_extract_shifted_candidates(
+            rgb_large_n,
+            self.small_win,
+            self.large_win,
+        )
+        (
+            route_mask,
+            route_score,
+            center_similarity,
+            best_noncenter,
+            best_candidate_index,
+        ) = self._compute_shared_route(
+            ir_small_n,
+            rgb_candidates_n,
+            gh,
+            gw,
+        )
+
+        # IR -> RGB: RGB queries IR center/large evidence.
+        delta_i2r = self._routed_cross_attention(
+            rgb_small_n,
+            ir_small_n,
+            ir_large_n,
+            route_mask,
+            self.rgb_from_ir,
+        )
+        # RGB -> IR: IR queries RGB center/large evidence.
+        delta_r2i = self._routed_cross_attention(
+            ir_small_n,
+            rgb_small_n,
+            rgb_large_n,
+            route_mask,
+            self.ir_from_rgb,
+        )
+
+        # Low light controls residual directions only, not range selection.
+        low_map = self._build_lowlight_map(
+            rgb_raw,
+            target_hw=(h0, w0),
+            ref_tensor=rgb_e,
+        )
+        if low_map is None:
+            low_win = rgb_small_n.new_zeros(
+                rgb_small_n.shape[0],
+                rgb_small_n.shape[1],
+            )
+        else:
+            low_map, _ = _lasci_pad_to_multiple(
+                low_map,
+                self.small_win,
+            )
+            low_win = F.avg_pool2d(
+                low_map,
+                kernel_size=self.small_win,
+                stride=self.small_win,
+            ).flatten(1)
+            low_win = low_win.to(
+                device=delta_i2r.device,
+                dtype=delta_i2r.dtype,
+            )
+
+        gate_i2r = 1.0 + self.lambda_low * low_win
+        gate_r2i = (1.0 - self.lambda_low * low_win).clamp(min=0.0)
+        delta_i2r = delta_i2r * gate_i2r.unsqueeze(-1).unsqueeze(-1)
+        delta_r2i = delta_r2i * gate_r2i.unsqueeze(-1).unsqueeze(-1)
+
+        if self.debug and not self.training:
+            self.last_debug = {
+                "route_score": route_score.detach().float().cpu().numpy(),
+                "route_mask": route_mask.detach().cpu().numpy(),
+                "center_similarity": (
+                    center_similarity.detach().float().cpu().numpy()
+                ),
+                "best_noncenter": (
+                    best_noncenter.detach().float().cpu().numpy()
+                ),
+                "best_noncenter_index": (
+                    best_candidate_index.detach().cpu().numpy()
+                ),
+                "low_win": low_win.detach().float().cpu().numpy(),
+                "selected_ratio": (
+                    route_mask.float().mean(dim=1).cpu().numpy()
+                ),
+                "gh": gh,
+                "gw": gw,
+            }
+
+        delta_i2r = _lasci_window_reverse(
+            delta_i2r,
+            gh,
+            gw,
+            self.small_win,
+        )
+        delta_r2i = _lasci_window_reverse(
+            delta_r2i,
+            gh,
+            gw,
+            self.small_win,
+        )
+        delta_i2r = _lasci_remove_pad(delta_i2r, pad_hw)
+        delta_r2i = _lasci_remove_pad(delta_r2i, pad_hw)
+
+        delta_i2r = self.rgb_out(delta_i2r)
+        delta_r2i = self.ir_out(delta_r2i)
+        delta_i2r = delta_i2r.to(
+            device=rgb_res.device,
+            dtype=rgb_res.dtype,
+        )
+        delta_r2i = delta_r2i.to(
+            device=ir_res.device,
+            dtype=ir_res.dtype,
+        )
+
+        rgb_out = (
+            rgb_res
+            + self.gamma_r.to(dtype=rgb_res.dtype) * delta_i2r
+        )
+        ir_out = (
+            ir_res
+            + self.gamma_i.to(dtype=ir_res.dtype) * delta_r2i
+        )
+        rgb_out = self.act(rgb_out + self.rgb_ffn(rgb_out))
+        ir_out = self.act(ir_out + self.ir_ffn(ir_out))
+
+        if self.return_pair:
+            return rgb_out, ir_out
+        return rgb_out + ir_out
+
+
+"""IR-guided confidence-rejected local RGB offset sampling.
+
+This file is self-contained so the class can first be tested outside Ultralytics
+and then copied into ``ultralytics/nn/modules/block.py``.
+
+Direction convention:
+    RGB->IR means that IR is the spatial reference.  At an IR position p, the
+    module searches RGB positions p + delta and writes the sampled RGB feature
+    into the IR-referenced fused representation.
+
+The initial research version intentionally contains no cross-attention,
+bidirectional update, low-light branch, or P4/P5 alignment.
+"""
+
+class IRGuidedSelectiveOffset(nn.Module):
+    """Selectively sample RGB into the IR coordinate frame at P3.
+
+    Args:
+        c: RGB/IR input channel count. Both inputs must have this channel count.
+        embed_dim: Common-space projection dimension. The supplied projection
+            probe checkpoint currently uses 128.
+        search_radius: Candidate-center radius in feature cells. Radius 2 gives
+            a 5*5 candidate set.
+        patch_radius: Local descriptor radius. Radius 1 gives a 3*3 patch.
+        margin_threshold: The best-noncenter minus center score threshold.
+        entropy_threshold: Maximum normalized candidate entropy for a reliable
+            shift.
+        softmax_tau: Temperature used for candidate probabilities and soft
+            offset expectation.
+        route_mode: One of ``center``, ``all``, or ``reliable``.
+            center: always use zero offset (Add baseline behavior).
+            all: apply the soft offset at every fully valid search position.
+            reliable: apply it only where margin and entropy pass the route.
+        freeze_projection: Freeze RGB/IR projection weights. This should be True
+            for the current RGB-box-supervised upper-bound experiment.
+        projection_path: Optional ``projection_probe.pt`` path. The checkpoint
+            must contain ``matcher``, ``input_dim``, and ``embed_dim``.
+        require_full_search: If True, only cells for which all candidates and
+            all patch tokens are in bounds may move. Other cells keep zero
+            offset.
+        debug: Store detached CPU diagnostic maps in ``last_debug``. Do not
+            enable this during normal training because it synchronizes devices.
+
+    Input:
+        ``[rgb, ir]``, both B*C*H*W tensors with identical shapes.
+
+    Output:
+        ``ir + routed_rgb``. At inactive locations, ``routed_rgb == rgb``, so
+        the exact zero-offset behavior is the ordinary Add fusion.
+    """
+
+    ROUTE_INVALID = 0
+    ROUTE_ALIGNED = 1
+    ROUTE_RELIABLE = 2
+    ROUTE_UNCERTAIN = 3
+    VALID_ROUTE_MODES = {"center", "all", "reliable"}
+
+    def __init__(
+        self,
+        c: int,
+        embed_dim: int = 64,
+        search_radius: int = 2,
+        patch_radius: int = 1,
+        margin_threshold: float = 0.10,
+        entropy_threshold: float = 0.68,
+        softmax_tau: float = 0.10,
+        route_mode: str = "reliable",
+        freeze_projection: bool = True,
+        projection_path: str = "",
+        require_full_search: bool = True,
+        debug: bool = False,
+    ) -> None:
+        super().__init__()
+        if c <= 0 or embed_dim <= 0:
+            raise ValueError("c and embed_dim must be positive.")
+        if search_radius < 0 or patch_radius < 0:
+            raise ValueError("search_radius and patch_radius must be non-negative.")
+        if softmax_tau <= 0:
+            raise ValueError("softmax_tau must be positive.")
+        if not 0.0 <= entropy_threshold <= 1.0:
+            raise ValueError("entropy_threshold must be in [0, 1].")
+        route_mode = str(route_mode).lower().strip()
+        if route_mode not in self.VALID_ROUTE_MODES:
+            raise ValueError(
+                "route_mode must be one of {}, got {!r}.".format(
+                    sorted(self.VALID_ROUTE_MODES), route_mode
+                )
+            )
+
+        self.c = int(c)
+        self.input_dim = int(c)
+        self.embed_dim = int(embed_dim)
+        self.search_radius = int(search_radius)
+        self.patch_radius = int(patch_radius)
+        self.margin_threshold = float(margin_threshold)
+        self.entropy_threshold = float(entropy_threshold)
+        self.softmax_tau = float(softmax_tau)
+        self.route_mode = route_mode
+        self.freeze_projection = bool(freeze_projection)
+        self.projection_path = str(projection_path or "")
+        self.require_full_search = bool(require_full_search)
+        self.debug = bool(debug)
+        self.last_debug: Optional[Dict[str, torch.Tensor]] = None
+
+        # Keep nn.Linear rather than Conv2d so projection_probe.pt loads exactly.
+        self.rgb_proj = nn.Linear(self.c, self.embed_dim, bias=True)
+        self.ir_proj = nn.Linear(self.c, self.embed_dim, bias=True)
+        nn.init.orthogonal_(self.rgb_proj.weight)
+        nn.init.orthogonal_(self.ir_proj.weight)
+        nn.init.zeros_(self.rgb_proj.bias)
+        nn.init.zeros_(self.ir_proj.bias)
+
+        candidates = [
+            (dx, dy)
+            for dy in range(-self.search_radius, self.search_radius + 1)
+            for dx in range(-self.search_radius, self.search_radius + 1)
+        ]
+        self.candidate_list: List[Tuple[int, int]] = candidates
+        self.center_index = candidates.index((0, 0))
+        self.register_buffer(
+            "candidate_offsets",
+            torch.tensor(candidates, dtype=torch.float32),
+            persistent=False,
+        )
+
+        if self.projection_path:
+            self.load_projection_checkpoint(self.projection_path)
+        self.set_projection_trainable(not self.freeze_projection)
+
+    def extra_repr(self) -> str:
+        return (
+            "c={}, embed_dim={}, search_radius={}, patch_radius={}, "
+            "margin_threshold={}, entropy_threshold={}, softmax_tau={}, "
+            "route_mode={!r}, freeze_projection={}, require_full_search={}".format(
+                self.c,
+                self.embed_dim,
+                self.search_radius,
+                self.patch_radius,
+                self.margin_threshold,
+                self.entropy_threshold,
+                self.softmax_tau,
+                self.route_mode,
+                self.freeze_projection,
+                self.require_full_search,
+            )
+        )
+
+    def set_route_mode(self, route_mode: str) -> None:
+        """Change the ablation mode without rebuilding the model."""
+        route_mode = str(route_mode).lower().strip()
+        if route_mode not in self.VALID_ROUTE_MODES:
+            raise ValueError(
+                "route_mode must be one of {}, got {!r}.".format(
+                    sorted(self.VALID_ROUTE_MODES), route_mode
+                )
+            )
+        self.route_mode = route_mode
+
+    def set_projection_trainable(self, trainable: bool) -> None:
+        for parameter in self.rgb_proj.parameters():
+            parameter.requires_grad_(bool(trainable))
+        for parameter in self.ir_proj.parameters():
+            parameter.requires_grad_(bool(trainable))
+        self.freeze_projection = not bool(trainable)
+
+    def load_projection_checkpoint(self, path: str) -> None:
+        """Load the RGB-box-supervised common-space probe checkpoint."""
+        checkpoint_path = Path(path).expanduser()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                "Projection checkpoint does not exist: {}".format(checkpoint_path)
+            )
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+        state = checkpoint.get("matcher", checkpoint)
+
+        checkpoint_input = checkpoint.get("input_dim")
+        checkpoint_embed = checkpoint.get("embed_dim")
+        if checkpoint_input is not None and int(checkpoint_input) != self.c:
+            raise ValueError(
+                "Projection input mismatch: module c={} but checkpoint input_dim={}."
+                .format(self.c, checkpoint_input)
+            )
+        if checkpoint_embed is not None and int(checkpoint_embed) != self.embed_dim:
+            raise ValueError(
+                "Projection embed mismatch: module embed_dim={} but checkpoint "
+                "embed_dim={}.".format(self.embed_dim, checkpoint_embed)
+            )
+
+        required = {
+            "rgb_proj.weight",
+            "rgb_proj.bias",
+            "ir_proj.weight",
+            "ir_proj.bias",
+        }
+        missing = sorted(required.difference(state.keys()))
+        if missing:
+            raise ValueError(
+                "Projection checkpoint is missing keys: {}".format(missing)
+            )
+        self.rgb_proj.load_state_dict(
+            {"weight": state["rgb_proj.weight"], "bias": state["rgb_proj.bias"]},
+            strict=True,
+        )
+        self.ir_proj.load_state_dict(
+            {"weight": state["ir_proj.weight"], "bias": state["ir_proj.bias"]},
+            strict=True,
+        )
+        self.projection_path = str(checkpoint_path.resolve())
+
+    @staticmethod
+    def _shift_source_to_destination(
+        tensor: torch.Tensor, dx: int, dy: int
+    ) -> torch.Tensor:
+        """Return out[..., y, x] = tensor[..., y + dy, x + dx]."""
+        if tensor.ndim < 2:
+            raise ValueError("Shifted tensor must have at least two dimensions.")
+        height, width = int(tensor.shape[-2]), int(tensor.shape[-1])
+        output = torch.zeros_like(tensor)
+
+        dst_x0 = max(0, -dx)
+        dst_x1 = min(width, width - dx)
+        dst_y0 = max(0, -dy)
+        dst_y1 = min(height, height - dy)
+        if dst_x1 <= dst_x0 or dst_y1 <= dst_y0:
+            return output
+        src_x0, src_x1 = dst_x0 + dx, dst_x1 + dx
+        src_y0, src_y1 = dst_y0 + dy, dst_y1 + dy
+        output[..., dst_y0:dst_y1, dst_x0:dst_x1] = tensor[
+            ..., src_y0:src_y1, src_x0:src_x1
+        ]
+        return output
+
+    def _project(self, feature: torch.Tensor, projection: nn.Linear) -> torch.Tensor:
+        # Linear consumes the last dimension and therefore matches the probe.
+        projected = projection(feature.permute(0, 2, 3, 1))
+        projected = F.normalize(projected, dim=-1, eps=1e-6)
+        return projected.permute(0, 3, 1, 2).contiguous()
+
+    def _dense_candidate_scores(
+        self, rgb: torch.Tensor, ir: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return float32 score maps and validity masks, both B*K*H*W."""
+        rgb_projected = self._project(rgb, self.rgb_proj)
+        ir_projected = self._project(ir, self.ir_proj)
+        batch, _, height, width = rgb_projected.shape
+        kernel = 2 * self.patch_radius + 1
+
+        # float32 score computation keeps entropy/margin stable under AMP.
+        ir_score = ir_projected.float()
+        base_valid = torch.ones(
+            (batch, 1, height, width),
+            device=rgb.device,
+            dtype=torch.float32,
+        )
+        score_maps: List[torch.Tensor] = []
+        valid_maps: List[torch.Tensor] = []
+        for dx, dy in self.candidate_list:
+            shifted_rgb = self._shift_source_to_destination(rgb_projected, dx, dy)
+            shifted_valid = self._shift_source_to_destination(base_valid, dx, dy)
+            point_score = (ir_score * shifted_rgb.float()).sum(dim=1, keepdim=True)
+            point_score = point_score * shifted_valid
+            patch_score = F.avg_pool2d(
+                point_score,
+                kernel_size=kernel,
+                stride=1,
+                padding=self.patch_radius,
+                count_include_pad=True,
+            )
+            patch_valid_fraction = F.avg_pool2d(
+                shifted_valid,
+                kernel_size=kernel,
+                stride=1,
+                padding=self.patch_radius,
+                count_include_pad=True,
+            )
+            candidate_valid = patch_valid_fraction >= (1.0 - 1e-6)
+            score_maps.append(patch_score[:, 0])
+            valid_maps.append(candidate_valid[:, 0])
+
+        scores = torch.stack(score_maps, dim=1)
+        valid = torch.stack(valid_maps, dim=1)
+        return scores, valid
+
+    def _route_from_scores(
+        self, scores: torch.Tensor, valid: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Build probability, offset, confidence, and three-state route maps."""
+        if scores.ndim != 4 or valid.shape != scores.shape:
+            raise ValueError("scores and valid must both have shape B*K*H*W.")
+        candidate_count = int(scores.shape[1])
+        if candidate_count != len(self.candidate_list):
+            raise ValueError("Candidate count does not match module geometry.")
+
+        center_valid = valid[:, self.center_index]
+        full_search_valid = valid.all(dim=1)
+        any_search_valid = valid.any(dim=1)
+        usable = center_valid & any_search_valid
+        if self.require_full_search:
+            usable = usable & full_search_valid
+
+        negative = torch.finfo(scores.dtype).min
+        masked_scores = scores.masked_fill(~valid, negative)
+        maximum = masked_scores.max(dim=1).values
+        maximum = torch.where(usable, maximum, torch.zeros_like(maximum))
+        logits = (masked_scores - maximum[:, None]) / self.softmax_tau
+        exp_scores = torch.where(valid, torch.exp(logits), torch.zeros_like(logits))
+        denominator = exp_scores.sum(dim=1).clamp_min(1e-12)
+        probabilities = exp_scores / denominator[:, None]
+        probabilities = torch.where(
+            usable[:, None], probabilities, torch.zeros_like(probabilities)
+        )
+
+        offsets = self.candidate_offsets.to(
+            device=scores.device, dtype=probabilities.dtype
+        )
+        pred_dx = (probabilities * offsets[:, 0][None, :, None, None]).sum(dim=1)
+        pred_dy = (probabilities * offsets[:, 1][None, :, None, None]).sum(dim=1)
+
+        entropy_raw = -torch.where(
+            probabilities > 0,
+            probabilities * torch.log(probabilities.clamp_min(1e-12)),
+            torch.zeros_like(probabilities),
+        ).sum(dim=1)
+        valid_count = valid.sum(dim=1)
+        entropy_denominator = torch.log(
+            valid_count.clamp_min(2).to(dtype=probabilities.dtype)
+        )
+        normalized_entropy = entropy_raw / entropy_denominator
+        normalized_entropy = torch.where(
+            usable, normalized_entropy, torch.ones_like(normalized_entropy)
+        )
+
+        noncenter = [
+            index for index in range(candidate_count) if index != self.center_index
+        ]
+        best_noncenter = masked_scores[:, noncenter].max(dim=1).values
+        center_score = masked_scores[:, self.center_index]
+        margin = best_noncenter - center_score
+        margin = torch.where(usable, margin, torch.zeros_like(margin))
+
+        route = torch.full_like(valid_count, self.ROUTE_INVALID, dtype=torch.uint8)
+        aligned = usable & (margin <= self.margin_threshold)
+        reliable = (
+            usable
+            & (margin > self.margin_threshold)
+            & (normalized_entropy <= self.entropy_threshold)
+        )
+        uncertain = (
+            usable
+            & (margin > self.margin_threshold)
+            & (normalized_entropy > self.entropy_threshold)
+        )
+        route[aligned] = self.ROUTE_ALIGNED
+        route[reliable] = self.ROUTE_RELIABLE
+        route[uncertain] = self.ROUTE_UNCERTAIN
+
+        return {
+            "probabilities": probabilities,
+            "pred_dx": pred_dx,
+            "pred_dy": pred_dy,
+            "entropy": normalized_entropy,
+            "margin": margin,
+            "route": route,
+            "usable": usable,
+            "full_search_valid": full_search_valid,
+        }
+
+    @staticmethod
+    def _base_grid(
+        batch: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        # align_corners=False: feature-cell center x maps to 2*(x+0.5)/W-1.
+        ys = (torch.arange(height, device=device, dtype=dtype) + 0.5)
+        xs = (torch.arange(width, device=device, dtype=dtype) + 0.5)
+        ys = 2.0 * ys / float(height) - 1.0
+        xs = 2.0 * xs / float(width) - 1.0
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        grid = torch.stack((xx, yy), dim=-1)
+        return grid.unsqueeze(0).expand(batch, -1, -1, -1).clone()
+
+    def _sample_rgb(
+        self,
+        rgb: torch.Tensor,
+        pred_dx: torch.Tensor,
+        pred_dy: torch.Tensor,
+        active: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, _, height, width = rgb.shape
+        dx = torch.where(active, pred_dx, torch.zeros_like(pred_dx))
+        dy = torch.where(active, pred_dy, torch.zeros_like(pred_dy))
+        dx = dx.clamp(-float(self.search_radius), float(self.search_radius))
+        dy = dy.clamp(-float(self.search_radius), float(self.search_radius))
+
+        grid = self._base_grid(
+            batch, height, width, rgb.device, rgb.dtype
+        )
+        grid[..., 0] = grid[..., 0] + dx.to(rgb.dtype) * (2.0 / float(width))
+        grid[..., 1] = grid[..., 1] + dy.to(rgb.dtype) * (2.0 / float(height))
+        sampled_rgb = F.grid_sample(
+            rgb,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+
+        # reliable位置使用重采样结果；
+        # aligned、uncertain及边界无效位置严格保留原RGB。
+        return torch.where(active[:, None], sampled_rgb, rgb)
+
+    def _save_debug(
+        self, route_data: Dict[str, torch.Tensor], active: torch.Tensor
+    ) -> None:
+        if not self.debug:
+            self.last_debug = None
+            return
+        self.last_debug = {
+            "route": route_data["route"].detach().cpu(),
+            "margin": route_data["margin"].detach().cpu(),
+            "entropy": route_data["entropy"].detach().cpu(),
+            "pred_dx": route_data["pred_dx"].detach().cpu(),
+            "pred_dy": route_data["pred_dy"].detach().cpu(),
+            "active": active.detach().cpu(),
+            "full_search_valid": route_data["full_search_valid"].detach().cpu(),
+        }
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != 2:
+            raise TypeError(
+                "IRGuidedSelectiveOffset expects [rgb_feat, ir_feat]."
+            )
+        rgb, ir = x
+        if not isinstance(rgb, torch.Tensor) or not isinstance(ir, torch.Tensor):
+            raise TypeError("Both inputs must be torch.Tensor objects.")
+        if rgb.shape != ir.shape or rgb.ndim != 4:
+            raise ValueError(
+                "RGB/IR must have identical B*C*H*W shapes, got {} and {}."
+                .format(tuple(rgb.shape), tuple(ir.shape))
+            )
+        if int(rgb.shape[1]) != self.c:
+            raise ValueError(
+                "Input channel mismatch: module c={} but feature channels={}."
+                .format(self.c, int(rgb.shape[1]))
+            )
+        if rgb.device != ir.device or rgb.dtype != ir.dtype:
+            ir = ir.to(device=rgb.device, dtype=rgb.dtype)
+
+        if self.route_mode == "center":
+            self.last_debug = None
+            return ir + rgb
+
+        scores, valid = self._dense_candidate_scores(rgb, ir)
+        route_data = self._route_from_scores(scores, valid)
+        if self.route_mode == "all":
+            active = route_data["usable"]
+        else:
+            active = route_data["route"].eq(self.ROUTE_RELIABLE)
+
+        routed_rgb = self._sample_rgb(
+            rgb, route_data["pred_dx"], route_data["pred_dy"], active
+        )
+        self._save_debug(route_data, active)
+        return ir + routed_rgb
+

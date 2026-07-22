@@ -447,6 +447,12 @@ class ModelEMA:
 
     def __init__(self, model, decay=0.9999, tau=2000, updates=0):
         """Create EMA."""
+        model = de_parallel(model)
+        for m in model.modules():
+            if hasattr(m, "last_mask_logits"):
+                m.last_mask_logits = None
+        self.ema = deepcopy(model).eval()
+        
         self.ema = deepcopy(de_parallel(model)).eval()  # FP32 EMA
         self.updates = updates  # number of EMA updates
         self.decay = lambda x: decay * (1 - math.exp(-x / tau))  # decay exponential ramp (to help early epochs)

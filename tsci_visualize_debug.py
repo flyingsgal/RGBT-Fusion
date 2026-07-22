@@ -295,11 +295,11 @@ def build_input_from_pair(rgb_path, ir_path, imgsz, device):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--weights", type=str, default="/storage/jyx4/projects/TwoStream_Yolov8-main/runs/dronevehicle/TSCIv2RawCueFusion/with_r_dark_ir_max/weights/best.pt", help="训练好的 best.pt 或 last.pt")
+    parser.add_argument("--weights", type=str, default="/storage/jyx4/projects/TwoStream_Yolov8-main/runs/dronevehicle/TSCIv2RawCueFusion/withr_max/weights/best.pt", help="训练好的 best.pt 或 last.pt")
     parser.add_argument("--rgb", type=str, default="/storage/jyx4/projects/dataset/DroneVehicle/OBBCrop/images/test/04514.jpg", help="RGB 图像路径")
     parser.add_argument("--ir", type=str, default="/storage/jyx4/projects/dataset/DroneVehicle/OBBCrop/image/test/04514.jpg", help="IR 图像路径")
-    parser.add_argument("--label", type=str, default="/storage/jyx4/projects/dataset/DroneVehicle/OBBCrop/labels/test/04514.txt", help="可选：YOLO label txt 路径，用于画 GT 框")
-    parser.add_argument("--out", type=str, default="/storage/jyx4/projects/TwoStream_Yolov8-main/runs/dronevehicle/TSCIv2RawCueFusion/with_r_dark_ir_max/test_hbb_4514", help="输出目录")
+    parser.add_argument("--label", type=str, default="/storage/jyx4/projects/dataset/DroneVehicle/OBBCrop/labels/test/04514.tt", help="可选：YOLO label txt 路径，用于画 GT 框")
+    parser.add_argument("--out", type=str, default="/storage/jyx4/projects/TwoStream_Yolov8-main/runs/dronevehicle/TSCIv2RawCueFusion/withr_max/test_hbb_4514", help="输出目录")
     parser.add_argument("--imgsz", type=int, default=640, help="输入尺寸")
     parser.add_argument("--device", type=str, default="cuda:0", help="cuda:0 或 cpu")
     parser.add_argument("--overlay-alpha", type=float, default=0.45)

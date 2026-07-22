@@ -1,0 +1,71 @@
+# Ultralytics YOLO - DroneVehicle two-stream P3 selective offset upper bound
+#
+# IMPORTANT:
+# 1) Replace /ABSOLUTE/PATH/TO/projection_probe.pt before model construction.
+# 2) Only P3 uses explicit RGB->IR offset sampling. P4/P5 remain plain ADD.
+# 3) This is the RGB-box-supervised projection upper-bound experiment, not the
+#    final no-RGB-box method.
+
+ch: 6
+nc: 5
+
+scales:
+  s: [0.33, 0.50, 1024]
+
+backbone:
+  - [-1, 1, IN, []]          # 0
+  - [-1, 1, Multiin, [1]]    # 1 RGB
+  - [-2, 1, Multiin, [2]]    # 2 IR
+
+  - [1, 1, Conv, [32, 3, 2]]
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 3, C2f, [64, True]]
+
+  - [2, 1, Conv, [32, 3, 2]]
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 3, C2f, [64, True]]
+
+  - [5, 1, Conv, [128, 3, 2]]
+  - [8, 1, Conv, [128, 3, 2]]
+  - [-2, 6, C2f, [128, True]]    # 11 RGB P3
+  - [-2, 6, C2f, [128, True]]    # 12 IR P3
+
+  - [-2, 1, Conv, [256, 3, 2]]
+  - [-2, 1, Conv, [256, 3, 2]]
+  - [-2, 6, C2f, [256, True]]    # 15 RGB P4
+  - [-2, 6, C2f, [256, True]]    # 16 IR P4
+
+  - [-2, 1, Conv, [512, 3, 2]]
+  - [-2, 1, Conv, [512, 3, 2]]
+  - [-2, 3, C2f, [512, True]]
+  - [-2, 3, C2f, [512, True]]
+  - [-2, 1, SPPF, [512, 5]]      # 21 RGB P5
+  - [-2, 1, SPPF, [512, 5]]      # 22 IR P5
+
+  # Parser prepends the actual scaled input c. Arguments below are:
+  # [embed_dim, search_radius, patch_radius, margin, entropy, tau,
+  #  route_mode, freeze_projection, projection_path,
+  #  require_full_search, debug]
+  - [[11, 12], 1, IRGuidedSelectiveOffset,[64, 2, 1, 0.10, 0.68, 0.10, "reliable", True]]
+  - [[15, 16], 1, ADD, [256]]    # 24 P4 plain add
+  - [[21, 22], 1, ADD, [512]]    # 25 P5 plain add
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 24], 1, Concat, [1]]
+  - [-1, 3, C2f, [512]]
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 23], 1, Concat, [1]]
+  - [-1, 3, C2f, [256]]
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 28], 1, Concat, [1]]
+  - [-1, 3, C2f, [512]]
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 25], 1, Concat, [1]]
+  - [-1, 3, C2f, [1024]]
+
+  - [[31, 34, 37], 1, OBB, [nc, 1]]
+

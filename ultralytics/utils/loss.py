@@ -10,7 +10,10 @@ from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigne
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
-
+import os
+from pathlib import Path
+import numpy as np
+from PIL import Image
 
 class VarifocalLoss(nn.Module):
     """
@@ -735,6 +738,161 @@ class v8OBBLoss(v8DetectionLoss):
         self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = RotatedBboxLoss(self.reg_max - 1, use_dfl=self.use_dfl).to(self.device)
 
+        self.model = model
+        self.mask_loss_gain = 0.05
+        self.mask_eta = 0.35
+        self.mask_loss_enable = False
+        # -------- mask visualization --------
+        self.mask_vis_enable = False
+        self.mask_vis_interval = 5000       # 每 500 iter 保存一次
+        self.mask_vis_dir = Path("runs/maskv1_debug")
+        self.mask_vis_max_layers = 3       # P3/P4/P5
+        self._mask_vis_step = 0
+        # 额外增加一个总 debug 开关
+        self.mask_debug_print = False
+        for m in self.model.modules():
+            if hasattr(m, "cache_aux_mask_logits"):
+                m.cache_aux_mask_logits = bool(self.mask_loss_enable)
+
+    def _clear_aux_mask_logits(self):
+        for m in self.model.modules():
+            if hasattr(m, "last_mask_logits"):
+                m.last_mask_logits = None
+    #收集 LASCIModule 缓存的 mask_logits
+    def _collect_aux_mask_logits(self):
+        aux = []
+
+        for m in self.model.modules():
+            mask_logits = getattr(m, "last_mask_logits", None)
+            if isinstance(mask_logits, torch.Tensor):
+                aux.append(mask_logits)
+
+        return aux
+    
+    # 用 OBB 标签生成 rotated Gaussian mask
+    def _build_rotated_gaussian_masks(self, batch, mask_logits):
+        """
+        Args:
+            batch: YOLO batch dict, contains batch_idx and bboxes [N,5]
+            mask_logits: list of [B,1,H,W]
+
+        Returns:
+            targets: list of [B,1,H,W]
+        """
+        targets = []
+
+        batch_idx = batch["batch_idx"].view(-1).long().to(self.device)
+        bboxes = batch["bboxes"].view(-1, 5).to(self.device)
+        # if torch.rand(1).item() < 0.001 and bboxes.numel():
+        #     print(
+        #         "[OBB batch bboxes]",
+        #         "shape=", tuple(bboxes.shape),
+        #         "first=", bboxes[0].detach().cpu().tolist(),
+        #         "angle_min=", float(bboxes[:, 4].min().detach().cpu()),
+        #         "angle_max=", float(bboxes[:, 4].max().detach().cpu()),
+        #         "angle_mean=", float(bboxes[:, 4].mean().detach().cpu()),
+        #     )
+
+        for logits in mask_logits:
+            b, _, h, w = logits.shape
+            target = torch.zeros((b, 1, h, w), device=logits.device, dtype=torch.float32)
+
+            # grid: [H,W]
+            ys = torch.arange(h, device=logits.device, dtype=torch.float32)
+            xs = torch.arange(w, device=logits.device, dtype=torch.float32)
+            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+
+            for i in range(bboxes.shape[0]):
+                bi = int(batch_idx[i].item())
+                if bi < 0 or bi >= b:
+                    continue
+
+                cx, cy, bw, bh, angle = bboxes[i]
+
+                # normalized -> feature coordinates
+                cx = cx * w
+                cy = cy * h
+                bw = bw * w
+                bh = bh * h
+
+                # 过滤极小框，和 OBB loss 的稳定性逻辑一致
+                if bw < 1.0 or bh < 1.0:
+                    continue
+
+                cos_a = torch.cos(angle)
+                sin_a = torch.sin(angle)
+
+                dx = xx - cx
+                dy = yy - cy
+
+                # rotate to box local coordinates
+                u = cos_a * dx + sin_a * dy
+                v = -sin_a * dx + cos_a * dy
+
+                sigma_w = torch.clamp(self.mask_eta * bw, min=1.0)
+                sigma_h = torch.clamp(self.mask_eta * bh, min=1.0)
+
+                g = torch.exp(
+                    -0.5 * ((u / sigma_w) ** 2 + (v / sigma_h) ** 2)
+                )
+
+                target[bi, 0] = torch.maximum(target[bi, 0], g)
+
+            targets.append(target)
+
+        return targets
+    # 计算 mask loss
+    def _dice_loss(self, pred_prob, target, eps=1e-6):
+        """
+        pred_prob, target: [B,1,H,W]
+        """
+        pred = pred_prob.flatten(1)
+        tgt = target.flatten(1)
+
+        inter = (pred * tgt).sum(dim=1)
+        denom = pred.sum(dim=1) + tgt.sum(dim=1)
+
+        loss = 1.0 - (2.0 * inter + eps) / (denom + eps)
+        return loss.mean()
+    def _compute_aux_mask_loss(self, batch):
+        mask_logits = self._collect_aux_mask_logits()
+        # if torch.rand(1).item() < 0.001:
+        #     print("[AuxMask] num_layers =", len(mask_logits), 
+        #         [tuple(x.shape) for x in mask_logits])
+
+        if len(mask_logits) == 0:
+            return None
+
+        targets = self._build_rotated_gaussian_masks(batch, mask_logits)
+
+        total = 0.0
+        valid = 0
+
+        for logits, target in zip(mask_logits, targets):
+            logits_f = logits.float()
+            target = target.to(device=logits.device, dtype=torch.float32)
+
+            bce = F.binary_cross_entropy_with_logits(logits_f, target, reduction="mean")
+            prob = torch.sigmoid(logits_f)
+            dice = self._dice_loss(prob, target)
+
+            total = total + bce + dice
+            valid += 1
+
+        if valid == 0:
+            return None
+
+        aux_loss = total / valid
+
+        self._maybe_visualize_aux_masks(
+            mask_logits=mask_logits,
+            targets=targets,
+            aux_mask_loss=aux_loss,
+        )
+
+        self._clear_aux_mask_logits()
+        return aux_loss
+
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
         if targets.shape[0] == 0:
@@ -752,6 +910,85 @@ class v8OBBLoss(v8DetectionLoss):
                     bboxes[..., :4].mul_(scale_tensor)
                     out[j, :n] = torch.cat([targets[matches, 1:2], bboxes], dim=-1)
         return out
+
+    @staticmethod
+    def _to_uint8_map(x):
+        """
+        x: [H,W] tensor
+        return: uint8 numpy [H,W]
+        """
+        # x = x.detach().float().cpu()
+        # x_min = x.min()
+        # x_max = x.max()
+        # x = (x - x_min) / (x_max - x_min + 1e-6)
+        # return (x.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        x = x.detach().float().cpu()
+        x = x.clamp(0.0, 1.0)
+        return (x.numpy() * 255.0).astype(np.uint8)
+
+    def _collect_mask_alphas(self):
+        alphas = []
+        for m in self.model.modules():
+            if hasattr(m, "mask_alpha_raw") and hasattr(m, "mask_alpha_max"):
+                alpha = m.mask_alpha_max * torch.sigmoid(m.mask_alpha_raw.detach())
+                alphas.append(float(alpha.cpu()))
+
+        return alphas
+    def _maybe_visualize_aux_masks(self, mask_logits, targets, aux_mask_loss=None):
+        """
+        保存每层的:
+        pred mask / target mask / abs error
+        """
+        if not self.mask_vis_enable:
+            return
+
+        # DDP 下只让 rank0 保存，避免多卡重复写
+        rank = int(os.environ.get("RANK", "0"))
+        if rank not in (-1, 0):
+            return
+
+        self._mask_vis_step += 1
+
+        if self._mask_vis_step % self.mask_vis_interval != 0:
+            return
+
+        self.mask_vis_dir.mkdir(parents=True, exist_ok=True)
+
+        with torch.no_grad():
+            msg = [f"[MaskVis] step={self._mask_vis_step}"]
+
+            if aux_mask_loss is not None:
+                msg.append(f"loss={float(aux_mask_loss.detach().cpu()):.4f}")
+            alphas = self._collect_mask_alphas()
+            if len(alphas):
+                msg.append("alpha=" + ",".join([f"{a:.5f}" for a in alphas]))
+            for li, (logits, target) in enumerate(zip(mask_logits, targets)):
+                if li >= self.mask_vis_max_layers:
+                    break
+
+                pred = torch.sigmoid(logits[0, 0])
+                tgt = target[0, 0].to(device=pred.device, dtype=pred.dtype)
+                err = (pred - tgt).abs()
+
+                pred_u8 = self._to_uint8_map(pred)
+                tgt_u8 = self._to_uint8_map(tgt)
+                err_u8 = self._to_uint8_map(err)
+
+                # 横向拼接：pred | target | error
+                canvas = np.concatenate([pred_u8, tgt_u8, err_u8], axis=1)
+
+                save_path = self.mask_vis_dir / f"step_{self._mask_vis_step:07d}_layer_{li}.png"
+                Image.fromarray(canvas).save(save_path)
+
+                msg.append(
+                    f"L{li}: "
+                    f"pred_mean={pred.mean().item():.4f}, "
+                    f"pred_max={pred.max().item():.4f}, "
+                    f"tgt_mean={tgt.mean().item():.4f}, "
+                    f"alpha=?"
+                )
+
+            print(" | ".join(msg))
 
     def __call__(self, preds, batch):
         """Calculate and return the loss for the YOLO model."""
@@ -823,7 +1060,14 @@ class v8OBBLoss(v8DetectionLoss):
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        total_loss = loss.sum()
+        if self.mask_loss_enable:
+            aux_mask_loss = self._compute_aux_mask_loss(batch)
+            if aux_mask_loss is not None:
+                total_loss = total_loss + self.mask_loss_gain * aux_mask_loss
+
+        # return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return total_loss * batch_size, loss.detach()  # loss(box, cls, dfl, aux_mask)
 
     def bbox_decode(self, anchor_points, pred_dist, pred_angle):
         """

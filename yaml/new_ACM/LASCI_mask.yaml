@@ -37,27 +37,20 @@ backbone:
   - [-2, 1, SPPF, [512, 5]]      # 21-P5/32 visible
   - [-2, 1, SPPF, [512, 5]]      # 22-P5/32 infrared
 
-  # # # P3 fusion
-  # - [[11, 12, 1], 1, LASCIModule, [128, 4, 6, 4, 0.35, 0.25, 0.5]]
-  # # # P4 fusion
-  # - [[15, 16, 1], 1, LASCIModule, [128, 4, 6, 4, 0.35, 0.25, 0.5]]
-  # # # P5 fusion
-  # - [[21, 22, 1], 1, LASCIModule, [128, 4, 6, 4, 0.35, 0.25, 0.5]]
-  
   # P3 fusion
-  - [[11, 12, 1], 1, LASCIModule, [128, 4, 6, 4]]
+  - [[11, 12, 1], 1, LASCIModulev2, [128, 4, 6, 4]]
 
   # P4 fusion
-  - [[15, 16, 1], 1, LASCIModule, [128, 4, 6, 4]]
+  - [[15, 16, 1], 1, LASCIModulev2, [128, 4, 6, 4]]
 
   # P5 fusion
-  - [[21, 22, 1], 1, LASCIModule, [128, 4, 6, 4]]
+  - [[21, 22, 1], 1, LASCIModulev2, [128, 4, 6, 4]]
 
 # YOLOv8.0 head
 head:
   # FPN: P5 -> P4
   - [-1, 1, nn.Upsample, [None, 2, 'nearest']]      # 26 upsample fused P5
-  - [[-1, 24], 1, Concat, [1]]                      # 27 cat fused P4
+  - [[-1, 24], 1, Concat, [1]]                      # 27 cat fused P4z
   - [-1, 3, C2f, [512]]                             # 28 P4 head
 
   # FPN: P4 -> P3

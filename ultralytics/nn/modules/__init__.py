@@ -106,6 +106,10 @@ from .block import (
     CMSSMahalanobisWindowInteraction,
     LASCIModule,
     LASCIDSSF,
+    LASCICECC,
+    LASCIModulev2,
+    LASCIModulev3,
+    IRGuidedSelectiveOffset,
 )
 from .conv import (
     CBAM,
@@ -225,4 +229,8 @@ __all__ = (
     "CMSSMahalanobisWindowInteraction",
     "LASCIModule",
     "LASCIDSSF",
+    "LASCICECC",
+    "LASCIModulev2",
+    "LASCIModulev3",
+    "IRGuidedSelectiveOffset",
 )

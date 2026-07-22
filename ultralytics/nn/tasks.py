@@ -109,6 +109,10 @@ from ultralytics.nn.modules import (
     CMSSMahalanobisWindowInteraction,
     LASCIModule,
     LASCIDSSF,
+    LASCICECC,
+    LASCIModulev2,
+    LASCIModulev3,
+    IRGuidedSelectiveOffset,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1287,7 +1291,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = c1
             # print(f"[CMSS-Mah] layer input f={f}, channels={ch_in}, c1={c1}, yaml_args={args}")
             args = [c1, *args]
-        elif m is LASCIModule:
+        elif m in {LASCIModule,LASCIModulev2,LASCIModulev3}:
             # LASCIModule 当前已经改为 return rgb_out + ir_out
             # 因此它是“多输入、单输出”的融合模块。
             #
@@ -1416,7 +1420,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 args = [c1a, c2]
             else:
                 args = [c1a, c2]
-        elif m in {LASCIDSSF}:
+        elif m in {LASCIDSSF,LASCICECC}:
             # 输入:
             #   [rgb_feat, ir_feat, rgb_raw]
             # 或:
@@ -1467,7 +1471,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c1, c2 = [ch[x] for x in f], (sum([ch[x] for x in f]) if args[0] == 'concat' else ch[f[0]])
             args = [c1, args[0]]
         elif m is ADD:
-#            print("ch[f]", f, ch[f[0]])
+            #print("ch[f]", f, ch[f[0]])
             c2 = ch[f[0]]
             args = [c2] 
             # if isinstance(f, list):
@@ -1516,6 +1520,20 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             gamma = args[0] if len(args) > 0 else 2
             b = args[1] if len(args) > 1 else 1
             args = [c1, gamma, b]
+        elif m is IRGuidedSelectiveOffset:  # noqa: F821 - snippet context
+            assert isinstance(f, list) and len(f) == 2, (  # noqa: F821
+                "IRGuidedSelectiveOffset expects [rgb_feat, ir_feat], got f={}".format(f)
+            )
+            c1_rgb, c1_ir = ch[f[0]], ch[f[1]]  # noqa: F821
+            assert c1_rgb == c1_ir, (
+                "IRGuidedSelectiveOffset channel mismatch: rgb={}, ir={}".format(
+                    c1_rgb, c1_ir
+                )
+            )
+            c1 = c1_rgb
+            c2 = c1_rgb
+            # YAML omits c. The parser supplies the width-scaled actual channel count.
+            args = [c1, *args]  # noqa: F821
         # elif m is ECA:
         #     c1 = ch[f[0]]+ch[f[1]]
         #     c2 = ch[f[0]]

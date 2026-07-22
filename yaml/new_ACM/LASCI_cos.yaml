@@ -37,21 +37,23 @@ backbone:
   - [-2, 1, SPPF, [512, 5]]      # 21-P5/32 visible
   - [-2, 1, SPPF, [512, 5]]      # 22-P5/32 infrared
 
-  # # # P3 fusion
-  # - [[11, 12, 1], 1, LASCIModule, [128, 4, 6, 4, 0.35, 0.25, 0.5]]
-  # # # P4 fusion
-  # - [[15, 16, 1], 1, LASCIModule, [128, 4, 6, 4, 0.35, 0.25, 0.5]]
-  # # # P5 fusion
-  # - [[21, 22, 1], 1, LASCIModule, [128, 4, 6, 4, 0.35, 0.25, 0.5]]
-  
+  # Reconstructed LASCIModule arguments:
+  # [embed_dim, small_win, large_win, num_heads,
+  #  sim_threshold, min_ratio, max_ratio, lambda_low]
+  #
+  # IR 3*3 reference vs RGB center+8 shifted 3*3 candidates.
+  # Unselected windows use 3*3 K/V; selected windows use 5*5 K/V.
+  # The shared route uses a raw cosine margin threshold of 0.05,
+  # has no forced lower ratio, and caps expansion at 35% per image.
+
   # P3 fusion
-  - [[11, 12, 1], 1, LASCIModule, [128, 4, 6, 4]]
+  - [[11, 12, 1], 1, LASCIModule, [128, 3, 5, 4, 0.05, 0.0, 0.35, 0.5]]
 
   # P4 fusion
-  - [[15, 16, 1], 1, LASCIModule, [128, 4, 6, 4]]
+  - [[15, 16, 1], 1, LASCIModule, [128, 3, 5, 4, 0.05, 0.0, 0.35, 0.5]]
 
   # P5 fusion
-  - [[21, 22, 1], 1, LASCIModule, [128, 4, 6, 4]]
+  - [[21, 22, 1], 1, LASCIModule, [128, 3, 5, 4, 0.05, 0.0, 0.35, 0.5]]
 
 # YOLOv8.0 head
 head:
