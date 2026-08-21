@@ -1,0 +1,109 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# RGB-Infrared YOLOv8 + FRCSF (parallel design)
+
+ch: 6
+nc: 5
+
+scales:
+  s: [0.33, 0.50, 1024]
+
+backbone:
+  - [-1, 1, IN, []]          # 0
+  - [-1, 1, Multiin, [1]]    # 1 RGB
+  - [-2, 1, Multiin, [2]]    # 2 Infrared
+
+  - [1, 1, Conv, [32, 3, 2]]     # 3-P1/2 visible
+  - [-1, 1, Conv, [64, 3, 2]]    # 4-P2/4 visible
+  - [-1, 3, C2f, [64, True]]     # 5
+
+  - [2, 1, Conv, [32, 3, 2]]     # 6-P1/2 infrared
+  - [-1, 1, Conv, [64, 3, 2]]    # 7-P2/4 infrared
+  - [-1, 3, C2f, [64, True]]     # 8
+
+  - [5, 1, Conv, [128, 3, 2]]    # 9-P3/8 visible
+  - [8, 1, Conv, [128, 3, 2]]    # 10-P3/8 infrared
+  - [-2, 6, C2f, [128, True]]    # 11-P3/8 visible
+  - [-2, 6, C2f, [128, True]]    # 12-P3/8 infrared
+
+  - [-2, 1, Conv, [256, 3, 2]]   # 13-P4/16 visible
+  - [-2, 1, Conv, [256, 3, 2]]   # 14-P4/16 infrared
+  - [-2, 6, C2f, [256, True]]    # 15-P4/16 visible
+  - [-2, 6, C2f, [256, True]]    # 16-P4/16 infrared
+
+  - [-2, 1, Conv, [512, 3, 2]]   # 17-P5/32 visible
+  - [-2, 1, Conv, [512, 3, 2]]   # 18-P5/32 infrared
+  - [-2, 3, C2f, [512, True]]    # 19-P5/32 visible
+  - [-2, 3, C2f, [512, True]]    # 20-P5/32 infrared
+  - [-2, 1, SPPF, [512, 5]]      # 21-P5/32 visible
+  - [-2, 1, SPPF, [512, 5]]      # 22-P5/32 infrared
+
+  # ============================================================
+  # FRCSFModule: Frequency Restructuring and Cross-modal State Fusion
+  # ============================================================
+  # Input: [RGB feature, IR feature]
+  # Output: one fused feature with the same channel count.
+  #
+  # IMPORTANT: channel c is inferred automatically by tasks.py.
+  # Do NOT write 128/256/512 here.
+  #
+  # Args:
+  # [rank_ratio, d_state, ssm_ratio, dt_rank, d_conv, dropout,
+  #  lf_mode, hf_mode, stage2_share_mode, stage2_direction,
+  #  cross_c_mode, cross_direction, fusion_mode]
+  #
+  # ---------------- First version / default ----------------
+  # rank_ratio=4                  -> bilinear rank r=C/4
+  # lf_mode='standard'            -> 3x3/5x5/7x7 ordinary conv branches
+  # hf_mode='multiply'            -> MGFF logic: F_hf' = A * F_hf
+  # stage2_share_mode='low_high'  -> theta_L for LL; one shared theta_H for LH/HL/HH
+  # stage2_direction='bidirectional'
+  # cross_c_mode='cross'          -> proposed Cross-C
+  # cross_direction='bidirectional'
+  # fusion_mode='concat'          -> Concat + 1x1 Conv
+  #
+  # ---------------- Ablation switches ----------------
+  # C/8 or C/2 rank: rank_ratio -> 8 or 2
+  # Lightweight LL: lf_mode -> 'depthwise'
+  # Residual HF: hf_mode -> 'residual'
+  # Independent Stage-2 bands: stage2_share_mode -> 'all_independent'
+  # All Stage-2 bands shared: stage2_share_mode -> 'all_shared'
+  # One-way Stage 2: stage2_direction -> 'rgb2ir' or 'ir2rgb'
+  # Remove Cross-C: cross_c_mode -> 'independent'
+  # Shared-C: cross_c_mode -> 'shared'
+  # One-way Cross-C: cross_direction -> 'rgb2ir' or 'ir2rgb'
+  # Add ablation: fusion_mode -> 'add' (Add + 3x3 Conv)
+
+  # P3 fusion
+  - [[11, 12], 1, FRCSFModule, [4, 16, 1.0, 'auto', 3, 0.0, 'standard', 'multiply', 'low_high', 'bidirectional', 'cross', 'bidirectional', 'concat']]
+
+  # P4 fusion
+  - [[15, 16], 1, FRCSFModule, [4, 16, 1.0, 'auto', 3, 0.0, 'standard', 'multiply', 'low_high', 'bidirectional', 'cross', 'bidirectional', 'concat']]
+
+  # P5 fusion
+  - [[21, 22], 1, FRCSFModule, [4, 16, 1.0, 'auto', 3, 0.0, 'standard', 'multiply', 'low_high', 'bidirectional', 'cross', 'bidirectional', 'concat']]
+
+# YOLOv8.0 head
+head:
+  # FPN: P5 -> P4
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]      # 26 upsample fused P5
+  - [[-1, 24], 1, Concat, [1]]                      # 27 cat fused P4
+  - [-1, 3, C2f, [512]]                             # 28 P4 head
+
+  # FPN: P4 -> P3
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]      # 29
+  - [[-1, 23], 1, Concat, [1]]                      # 30 cat fused P3
+  - [-1, 3, C2f, [256]]                             # 31 P3/8 small
+
+  # PAN: P3 -> P4
+  - [-1, 1, Conv, [256, 3, 2]]                      # 32
+  - [[-1, 28], 1, Concat, [1]]                      # 33 cat head P4
+  - [-1, 3, C2f, [512]]                             # 34 P4/16 medium
+
+  # PAN: P4 -> P5
+  - [-1, 1, Conv, [512, 3, 2]]                      # 35
+  - [[-1, 25], 1, Concat, [1]]                      # 36 cat fused P5
+  - [-1, 3, C2f, [1024]]                            # 37 P5/32 large
+
+  # OBB detection
+  - [[31, 34, 37], 1, OBB, [nc, 1]]                 # 38 OBB(P3, P4, P5)
+  # - [[31, 34, 37], 1, Detect, [nc]]               # 38 Detect(P3, P4, P5)
