@@ -14,4 +14,6 @@ model.val(
     augment=False,
     project="./runs/diagnostic",
     name="base_best_full_val",
+    iou=0.5,     # 用于 NMS
+    conf=0.001,  # 建议评估时用很低的 conf（0.001/0.01），这样不会在评估前丢弃太多预测
 )

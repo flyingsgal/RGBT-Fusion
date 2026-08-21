@@ -1,15 +1,18 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 """Block modules."""
+from __future__ import annotations
+import os
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Sequence, Union
+
+
 
 __all__ = (
     "DFL",
@@ -92,6 +95,15 @@ __all__ = (
     "LASCIModulev2",
     "LASCIModulev3",
     "IRGuidedSelectiveOffset",
+    "ProgressiveSCI", 
+    "SCISelect", 
+    "SCIPairFuse",
+    "FRCSFModule",
+    "FreqMoERouterSpecific",
+    "FreqMoEFullIndependent",
+    "FreqMoEFullIndependentV2",
+    "FreqMoEFullIndependentV2Residual",
+    "FreqCoupledWaveletFusion",
 )
 
 
@@ -11770,3 +11782,4258 @@ class IRGuidedSelectiveOffset(nn.Module):
         self._save_debug(route_data, active)
         return ir + routed_rgb
 
+
+"""
+ProgressiveSCI（优化版）
+========================
+
+本文件是追加到 ultralytics/nn/modules/block.py 末尾的模块代码，
+不是 Ultralytics 原始 block.py 的完整替代文件。
+
+与上一版保持一致的接口：
+- ProgressiveSCI 输入：[rgb_feat, ir_feat, optional_rgb_raw]
+- ProgressiveSCI 输出：(rgb_out, ir_out)
+- YAML 参数顺序：
+    [embed_dim, center_win, support_size, num_heads,
+     max_iters, relation_dim, selection_tau, lambda_low]
+- SCISelect 与 SCIPairFuse 的使用方式不变；tasks.py 不需要修改。
+
+本版主要优化：
+1. 9 个候选窗口一次性张量化评分，删除逐候选 Python 循环；
+2. 候选池化特征、候选关系投影、位置编码在迭代前只计算一次；
+3. 选中候选通过小型候选—支持域映射矩阵一次性组合；
+4. 删除训练路径中的 GPU 张量 Python 条件判断，避免频繁同步；
+5. 使用轻量显式多头交叉注意力，减少小窗口场景下 MultiheadAttention 调度开销；
+6. 仍保持“每轮重算中心相关关系、候选价值与 STOP”的渐进语义。
+
+边界处理：
+- 中心窗口不重叠；
+- H/W 不能被中心窗口整除时，仅在右侧和下侧 replicate padding；
+- 输出前严格裁回原尺寸；
+- 兼容 640×512、640×640 对应的 P3/P4/P5 特征尺寸。
+
+当前允许的几何配置：
+- 3×3 中心、5×5 支持域；
+- 4×4 中心、6×6 支持域；
+以及一般形式 support_size = center_win + 2。
+上述配置均产生 9 个偏移候选。
+"""
+
+
+def _psci_pad_to_multiple(
+    x: torch.Tensor,
+    multiple: int,
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """将 BCHW 特征在右侧和下侧补齐到 multiple 的整数倍。"""
+    if x.ndim != 4:
+        raise ValueError(f"Expected BCHW tensor, got shape={tuple(x.shape)}")
+    _, _, h, w = x.shape
+    pad_h = (multiple - h % multiple) % multiple
+    pad_w = (multiple - w % multiple) % multiple
+    if pad_h or pad_w:
+        # 复制填充避免零填充在边界制造异常暗区。
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+    return x, (pad_h, pad_w)
+
+
+def _psci_remove_pad(x: torch.Tensor, pad_hw: Tuple[int, int]) -> torch.Tensor:
+    """裁掉 _psci_pad_to_multiple 增加的右侧/下侧区域。"""
+    pad_h, pad_w = pad_hw
+    if pad_h:
+        x = x[:, :, :-pad_h, :]
+    if pad_w:
+        x = x[:, :, :, :-pad_w]
+    return x
+
+
+def _psci_partition_nonoverlap(
+    x: torch.Tensor,
+    win: int,
+) -> Tuple[torch.Tensor, int, int]:
+    """
+    将 BCHW 特征划分为不重叠中心窗口。
+
+    Returns:
+        windows: [B, L, win², C]
+        gh, gw: 中心窗口网格高宽，L = gh × gw
+    """
+    b, c, h, w = x.shape
+    if h % win != 0 or w % win != 0:
+        raise ValueError(f"H={h}, W={w} must be divisible by win={win}")
+    gh, gw = h // win, w // win
+    x = x.view(b, c, gh, win, gw, win)
+    x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+    return x.view(b, gh * gw, win * win, c), gh, gw
+
+
+def _psci_reverse_nonoverlap(
+    windows: torch.Tensor,
+    gh: int,
+    gw: int,
+    win: int,
+) -> torch.Tensor:
+    """将 [B,L,win²,C] 的不重叠窗口恢复为 BCHW 特征图。"""
+    b, l, n, c = windows.shape
+    if l != gh * gw or n != win * win:
+        raise ValueError(
+            f"Invalid window shape={tuple(windows.shape)}, gh={gh}, gw={gw}, win={win}"
+        )
+    x = windows.view(b, gh, gw, win, win, c)
+    x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+    return x.view(b, c, gh * win, gw * win)
+
+
+def _psci_extract_support(
+    x: torch.Tensor,
+    center_win: int,
+    support_size: int,
+) -> torch.Tensor:
+    """
+    为每个不重叠中心窗口提取另一模态支持域。
+
+    例如 center_win=3、support_size=5：
+    - 特征图四周 replicate padding 1 个特征点；
+    - kernel=5、stride=3 执行 unfold；
+    - 每个中心得到 25 个支持域 token。
+
+    Returns:
+        support: [B, L, support_size², C]
+    """
+    if center_win <= 0 or support_size < center_win:
+        raise ValueError("support_size must be >= center_win > 0")
+    diff = support_size - center_win
+    if diff % 2 != 0:
+        raise ValueError(
+            "support_size-center_win must be even so the support is centered; "
+            f"got center_win={center_win}, support_size={support_size}"
+        )
+
+    margin = diff // 2
+    if margin:
+        x = F.pad(x, (margin, margin, margin, margin), mode="replicate")
+
+    b, c, _, _ = x.shape
+    patches = F.unfold(x, kernel_size=support_size, stride=center_win)
+    patches = patches.transpose(1, 2).contiguous()  # [B,L,C*S²]
+    return patches.view(b, -1, support_size * support_size, c)
+
+
+def _psci_candidate_indices(center_win: int, support_size: int) -> torch.Tensor:
+    """
+    返回 K 个候选窗口在支持域中的扁平 token 索引。
+
+    3×3→5×5 或 4×4→6×6 时，均有 9 个候选；
+    每个候选包含 center_win² 个 token。
+    """
+    shift_count = support_size - center_win + 1
+    indices: List[List[int]] = []
+    for oy in range(shift_count):
+        for ox in range(shift_count):
+            ids = []
+            for yy in range(center_win):
+                for xx in range(center_win):
+                    ids.append((oy + yy) * support_size + (ox + xx))
+            indices.append(ids)
+    return torch.tensor(indices, dtype=torch.long)
+
+
+def _psci_relative_positions(center_win: int, support_size: int) -> torch.Tensor:
+    """生成候选相对中心的二维偏移，顺序与候选索引一致。"""
+    shift_count = support_size - center_win + 1
+    center_offset = (shift_count - 1) / 2.0
+    positions = []
+    for oy in range(shift_count):
+        for ox in range(shift_count):
+            positions.append([oy - center_offset, ox - center_offset])
+    return torch.tensor(positions, dtype=torch.float32)
+
+
+def _psci_candidate_token_matrix(
+    candidate_index: torch.Tensor,
+    support_token_count: int,
+) -> torch.Tensor:
+    """
+    构造候选到支持域的 token 映射矩阵。
+
+    Returns:
+        matrix: [K,N,S²]
+
+    matrix[k,n,s] = 1 表示第 k 个候选的第 n 个 token
+    读取支持域中的第 s 个 token。
+    """
+    k, n = candidate_index.shape
+    matrix = torch.zeros(k, n, support_token_count, dtype=torch.float32)
+    matrix.scatter_(2, candidate_index.unsqueeze(-1), 1.0)
+    return matrix
+
+
+def _psci_luminance_low_map(
+    rgb_raw: Optional[torch.Tensor],
+    target_hw: Tuple[int, int],
+    ref: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """
+    从 RGB 原图生成局部低照度图：low = 1 - luminance。
+
+    rgb_raw 通常已归一化到 [0,1]；如果仍在 [0,255]，自动除以 255。
+    输出大小与当前特征层一致。
+    """
+    if rgb_raw is None:
+        return None
+    if rgb_raw.ndim != 4 or rgb_raw.shape[1] < 3:
+        return None
+
+    rgb = rgb_raw[:, :3].to(device=ref.device, dtype=ref.dtype)
+
+    # 该判断完全留在设备端，不调用 .item()，避免 CPU/GPU 同步。
+    max_value = rgb.detach().amax() if rgb.numel() else rgb.new_tensor(1.0)
+    scale = torch.where(
+        max_value > 1.5,
+        rgb.new_tensor(255.0),
+        rgb.new_tensor(1.0),
+    )
+    rgb = (rgb / scale).clamp(0.0, 1.0)
+
+    # 若数据加载器实际使用 BGR，需要相应调换通道系数。
+    lum = 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+    low = 1.0 - lum
+    return F.interpolate(low, size=target_hw, mode="bilinear", align_corners=False)
+
+
+class _DirectionalCrossAttention(nn.Module):
+    """
+    单方向局部多头交叉注意力。
+
+    这里不用 nn.MultiheadAttention，而是显式完成 Q/K/V、分头矩阵乘法和输出投影。
+    对 N=9 或 N=16 的大量小窗口，通常能减少通用 MHA 封装的调度开销。
+    """
+
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"embed_dim={dim} must be divisible by num_heads={num_heads}")
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_norm = nn.LayerNorm(dim)
+        self.kv_norm = nn.LayerNorm(dim)
+        self.q_proj = nn.Linear(dim, dim, bias=True)
+        self.kv_proj = nn.Linear(dim, dim * 2, bias=True)
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+
+        hidden = max(dim // 2, 16)
+        self.message_gate = nn.Sequential(
+            nn.Linear(dim * 3, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(
+        self,
+        target: torch.Tensor,
+        source: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            target: [B,L,N,C]，当前待更新中心状态
+            source: [B,L,N,C]，本轮选中的另一模态候选
+
+        Returns:
+            message: [B,L,N,C]
+            gate: [B,L,1,1]
+        """
+        b, l, n, c = target.shape
+        bl = b * l
+
+        q = self.q_proj(self.q_norm(target)).view(
+            bl, n, self.num_heads, self.head_dim
+        )
+        q = q.permute(0, 2, 1, 3)  # [BL,H,N,D]
+
+        kv = self.kv_proj(self.kv_norm(source)).view(
+            bl, n, 2, self.num_heads, self.head_dim
+        )
+        kv = kv.permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]  # [BL,H,N,D]
+
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        message = torch.matmul(attn, v)
+        message = message.permute(0, 2, 1, 3).contiguous().view(b, l, n, c)
+        message = self.out_proj(message)
+
+        t_pool = target.mean(dim=2)
+        s_pool = source.mean(dim=2)
+        gate = self.message_gate(
+            torch.cat([t_pool, s_pool, torch.abs(t_pool - s_pool)], dim=-1)
+        )
+        return message, gate.unsqueeze(-1)
+
+
+class _CandidateValueEstimator(nn.Module):
+    """
+    向量化候选价值评估器。
+
+    与上一版的语义保持一致：
+    - 当前中心状态每轮都会变化并重新投影；
+    - 候选特征、候选池化、候选关系投影和位置编码属于静态源信息，
+      在同一方向的多轮迭代中只计算一次；
+    - 评分仍联合中心、候选、差异、乘积、token 结构关系、位置、
+      模态可靠性与低照度信息；
+    - STOP 仍基于当前中心和未选择候选的摘要动态计算。
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        relation_dim: int,
+        center_win: int,
+        support_size: int,
+        pos_dim: int = 16,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.center_win = center_win
+        self.token_count = center_win * center_win
+        self.support_token_count = support_size * support_size
+
+        candidate_index = _psci_candidate_indices(center_win, support_size)
+        relative_positions = _psci_relative_positions(center_win, support_size)
+        token_matrix = _psci_candidate_token_matrix(
+            candidate_index, self.support_token_count
+        )
+        pool_matrix = token_matrix.sum(dim=1) / float(self.token_count)
+
+        self.register_buffer("candidate_index", candidate_index, persistent=False)
+        self.register_buffer(
+            "candidate_flat_index", candidate_index.reshape(-1), persistent=False
+        )
+        self.register_buffer("candidate_pool_matrix", pool_matrix, persistent=False)
+        self.register_buffer("relative_positions", relative_positions, persistent=False)
+        self.num_candidates = candidate_index.shape[0]
+
+        self.target_rel = nn.Linear(dim, relation_dim, bias=False)
+        self.source_rel = nn.Linear(dim, relation_dim, bias=False)
+        self.position_encoder = nn.Sequential(
+            nn.Linear(2, pos_dim),
+            nn.SiLU(),
+            nn.Linear(pos_dim, pos_dim),
+        )
+
+        # 4*dim：target、candidate、绝对差、逐元素乘积
+        # N*N：完整 token 结构关系
+        # pos_dim：相对位置编码
+        # 2：source_quality 与 target_low
+        score_in = 4 * dim + self.token_count * self.token_count + pos_dim + 2
+        hidden = max(dim * 2, 64)
+        hidden2 = max(hidden // 2, 32)
+        self.score_head = nn.Sequential(
+            nn.Linear(score_in, hidden),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden2),
+            nn.SiLU(),
+            nn.Linear(hidden2, 1),
+        )
+
+        # STOP：当前中心、剩余候选均值/最大摘要、剩余比例、低照度。
+        stop_in = 3 * dim + 2
+        self.stop_head = nn.Sequential(
+            nn.Linear(stop_in, hidden),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def prepare_source(
+        self,
+        source_support: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        预计算多轮迭代中不变的源候选信息。
+
+        Args:
+            source_support: [B,L,S²,C]
+
+        Returns:
+            candidate_pools: [B,L,K,C]
+            source_rel_support: [B,L,S²,D]
+            pos_embed: [K,P]
+        """
+        pool_matrix = self.candidate_pool_matrix.to(dtype=source_support.dtype)
+
+        # [K,S²] × [B,L,S²,C] -> [B,L,K,C]
+        candidate_pools = torch.einsum(
+            "ks,blsc->blkc", pool_matrix, source_support
+        )
+
+        # 源端投影与归一化只需执行一次；下一轮只重算目标端。
+        source_rel_support = F.normalize(
+            self.source_rel(source_support), dim=-1, eps=1e-6
+        )
+        pos_embed = self.position_encoder(
+            self.relative_positions.to(dtype=source_support.dtype)
+        )
+        return candidate_pools, source_rel_support, pos_embed
+
+    def forward(
+        self,
+        target: torch.Tensor,
+        candidate_pools: torch.Tensor,
+        source_rel_support: torch.Tensor,
+        pos_embed: torch.Tensor,
+        selected_mask: torch.Tensor,
+        source_quality: torch.Tensor,
+        target_low: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            target: [B,L,N,C]
+            candidate_pools: [B,L,K,C]，由 prepare_source 缓存
+            source_rel_support: [B,L,S²,D]，由 prepare_source 缓存
+            pos_embed: [K,P]，由 prepare_source 缓存
+            selected_mask: [B,L,K] bool
+            source_quality: [B,L,K]
+            target_low: [B,L]
+
+        Returns:
+            candidate_logits: [B,L,K]
+            stop_logit: [B,L,1]
+        """
+        b, l, n, c = target.shape
+        if n != self.token_count:
+            raise ValueError(f"Expected {self.token_count} target tokens, got {n}")
+
+        k_num = self.num_candidates
+        t_pool = target.mean(dim=2)  # [B,L,C]
+        t_rel = F.normalize(self.target_rel(target), dim=-1, eps=1e-6)
+
+        # 先计算中心 N 个 token 与完整支持域 S² 个 token 的关系：
+        # [B,L,N,D] × [B,L,S²,D] -> [B,L,N,S²]
+        # 这样源关系投影只计算一次，也避免为重叠候选重复投影相同 token。
+        relation_full = torch.einsum(
+            "blnd,blsd->blns", t_rel, source_rel_support
+        )
+
+        # 从完整关系中一次性抽取 K 个候选各自的 N 个源 token。
+        # [B,L,N,K*N] -> [B,L,K,N,N]
+        relation = relation_full.index_select(
+            dim=-1, index=self.candidate_flat_index
+        )
+        relation = relation.view(b, l, n, k_num, n)
+        relation = relation.permute(0, 1, 3, 2, 4).contiguous()
+        relation_flat = relation.flatten(start_dim=-2)  # [B,L,K,N*N]
+
+        # 所有候选一次性构造评分特征，不再执行 9 次 score_head。
+        t_expand = t_pool.unsqueeze(2).expand(-1, -1, k_num, -1)
+        pos_expand = pos_embed.view(1, 1, k_num, -1).expand(b, l, -1, -1)
+        quality = source_quality.unsqueeze(-1)
+        low = target_low.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, k_num, -1)
+
+        score_feature = torch.cat(
+            [
+                t_expand,
+                candidate_pools,
+                torch.abs(t_expand - candidate_pools),
+                t_expand * candidate_pools,
+                relation_flat,
+                pos_expand,
+                quality,
+                low,
+            ],
+            dim=-1,
+        )
+        candidate_logits = self.score_head(score_feature).squeeze(-1)
+
+        # STOP 根据尚未选择的候选摘要动态计算。
+        remaining = (~selected_mask).to(candidate_pools.dtype)
+        remain_count = remaining.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        remain_mean = (
+            candidate_pools * remaining.unsqueeze(-1)
+        ).sum(dim=2) / remain_count
+
+        neg = torch.finfo(candidate_pools.dtype).min
+        remain_max = candidate_pools.masked_fill(
+            selected_mask.unsqueeze(-1), neg
+        ).amax(dim=2)
+        all_selected = selected_mask.all(dim=-1, keepdim=True)
+        remain_max = torch.where(
+            all_selected, torch.zeros_like(remain_max), remain_max
+        )
+        remain_ratio = remaining.mean(dim=-1, keepdim=True)
+
+        stop_feature = torch.cat(
+            [
+                t_pool,
+                remain_mean,
+                remain_max,
+                remain_ratio,
+                target_low.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        stop_logit = self.stop_head(stop_feature)
+        return candidate_logits, stop_logit
+
+
+class ProgressiveSCI(nn.Module):
+    """
+    Progressive Selective Cross-modal Interaction（优化版）。
+
+    YAML 参数顺序（parse_model 自动在最前面插入输入通道 c）：
+        [embed_dim, center_win, support_size, num_heads,
+         max_iters, relation_dim, selection_tau, lambda_low]
+
+    输入：
+        [rgb_feat, ir_feat, rgb_raw] 或 [rgb_feat, ir_feat]
+
+    输出：
+        (rgb_out, ir_out)
+
+    模块内部：
+    - RGB→IR 与 IR→RGB 平行运行；
+    - 每个方向独立维护中心状态、已选掩码与 STOP；
+    - 每轮执行“候选评估 → 选择/STOP → 交叉注意力 → 残差更新”；
+    - 两个方向始终从模块输入时的原始另一模态支持域读取源信息，
+      不使用对方已经更新后的状态，因此不形成循环往返。
+    """
+
+    def __init__(
+        self,
+        c: int,
+        embed_dim: int = 64,
+        center_win: int = 3,
+        support_size: int = 5,
+        num_heads: int = 4,
+        max_iters: int = 2,
+        relation_dim: int = 24,
+        selection_tau: float = 0.7,
+        lambda_low: float = 0.5,
+    ):
+        super().__init__()
+
+        # 3×3→5×5 与 4×4→6×6 都满足该关系，并都产生 9 个候选。
+        if center_win <= 0 or support_size != center_win + 2:
+            raise ValueError(
+                "ProgressiveSCI requires support_size = center_win + 2; "
+                f"got center_win={center_win}, support_size={support_size}."
+            )
+        if max_iters < 1:
+            raise ValueError("max_iters must be >= 1")
+        if max_iters > (support_size - center_win + 1) ** 2:
+            raise ValueError("max_iters cannot exceed the number of candidates")
+        if not 0.0 <= lambda_low <= 1.0:
+            raise ValueError("lambda_low should be in [0,1]")
+
+        self.c = c
+        self.embed_dim = embed_dim
+        self.center_win = center_win
+        self.support_size = support_size
+        self.max_iters = max_iters
+        self.selection_tau = float(selection_tau)
+        self.lambda_low = float(lambda_low)
+
+        candidate_index = _psci_candidate_indices(center_win, support_size)
+        token_matrix = _psci_candidate_token_matrix(
+            candidate_index, support_size * support_size
+        )
+        pool_matrix = token_matrix.sum(dim=1) / float(center_win * center_win)
+
+        self.register_buffer("candidate_index", candidate_index, persistent=False)
+        self.register_buffer("candidate_token_matrix", token_matrix, persistent=False)
+        self.register_buffer("candidate_pool_matrix", pool_matrix, persistent=False)
+        self.num_candidates = candidate_index.shape[0]
+
+        # 模态独立输入投影，避免强制共享变换。
+        self.rgb_in = nn.Sequential(
+            nn.Conv2d(c, embed_dim, 1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.SiLU(),
+        )
+        self.ir_in = nn.Sequential(
+            nn.Conv2d(c, embed_dim, 1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.SiLU(),
+        )
+
+        # 两个方向拥有独立的价值评估器和交叉注意力参数。
+        self.value_r2i = _CandidateValueEstimator(
+            embed_dim, relation_dim, center_win, support_size
+        )
+        self.value_i2r = _CandidateValueEstimator(
+            embed_dim, relation_dim, center_win, support_size
+        )
+        self.attn_r2i = _DirectionalCrossAttention(embed_dim, num_heads)
+        self.attn_i2r = _DirectionalCrossAttention(embed_dim, num_heads)
+
+        self.rgb_out = nn.Sequential(
+            nn.Conv2d(embed_dim, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+        self.ir_out = nn.Sequential(
+            nn.Conv2d(embed_dim, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+
+        # 小正值初始化：保留原分支，同时让新模块早期即可获得梯度。
+        self.gamma_rgb = nn.Parameter(torch.tensor(0.1))
+        self.gamma_ir = nn.Parameter(torch.tensor(0.1))
+
+        # 默认关闭调试，防止每个 step 的 .item() 触发同步。
+        self.debug_enabled = False
+        self.last_debug = {}
+
+    def _hard_or_st_choice(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        训练：Straight-Through Gumbel-Softmax；
+        推理：确定性 argmax。
+        """
+        if self.training:
+            choice = F.gumbel_softmax(
+                logits.float(), tau=self.selection_tau, hard=True, dim=-1
+            )
+            return choice.to(dtype=logits.dtype)
+        index = logits.argmax(dim=-1)
+        return F.one_hot(index, num_classes=logits.shape[-1]).to(logits.dtype)
+
+    def _candidate_low_values(
+        self,
+        low_support: Optional[torch.Tensor],
+        b: int,
+        l: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """一次性计算 K 个 RGB 候选各自的平均低光程度。"""
+        if low_support is None:
+            return torch.zeros(
+                b, l, self.num_candidates, device=device, dtype=dtype
+            )
+
+        # low_support: [B,L,S²,1]
+        pool_matrix = self.candidate_pool_matrix.to(
+            device=low_support.device, dtype=low_support.dtype
+        )
+        values = torch.einsum("ks,blsc->blkc", pool_matrix, low_support)
+        return values.squeeze(-1).to(device=device, dtype=dtype)
+
+    def _compose_selected_source(
+        self,
+        source_support: torch.Tensor,
+        candidate_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        一次性根据 K 个候选权重构造本轮源窗口。
+
+        candidate_weight 前向为 one-hot；反向保留 ST 路由梯度。
+        使用 [K,N,S²] 的固定映射，避免逐候选 index_select 与累加。
+        """
+        token_matrix = self.candidate_token_matrix.to(
+            device=source_support.device, dtype=source_support.dtype
+        )
+
+        # 先把候选权重映射为每个目标 token 对支持域 token 的读取权重：
+        # [B,L,K] × [K,N,S²] -> [B,L,N,S²]
+        token_weight = torch.einsum(
+            "blk,kns->blns", candidate_weight, token_matrix
+        )
+
+        # [B,L,N,S²] × [B,L,S²,C] -> [B,L,N,C]
+        return torch.einsum("blns,blsc->blnc", token_weight, source_support)
+
+    def _run_direction(
+        self,
+        target_initial: torch.Tensor,
+        source_support: torch.Tensor,
+        estimator: _CandidateValueEstimator,
+        attention: _DirectionalCrossAttention,
+        source_quality: torch.Tensor,
+        target_low: torch.Tensor,
+        low_mode: str,
+        source_candidate_low: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        在单一方向内执行有限轮渐进选择。
+
+        low_mode:
+            "r2i"：RGB 为源，低光时抑制 RGB→IR；
+            "i2r"：RGB 为目标，低光时增强 IR→RGB。
+        """
+        b, l, _, _ = target_initial.shape
+        state = target_initial
+
+        selected_mask = torch.zeros(
+            b, l, self.num_candidates, device=state.device, dtype=torch.bool
+        )
+        active = torch.ones(b, l, device=state.device, dtype=state.dtype)
+        selected_count = torch.zeros_like(active)
+
+        # 静态源候选信息在所有迭代轮之间复用。
+        candidate_pools, source_rel_support, pos_embed = estimator.prepare_source(
+            source_support
+        )
+
+        for _ in range(self.max_iters):
+            candidate_logits, stop_logit = estimator(
+                target=state,
+                candidate_pools=candidate_pools,
+                source_rel_support=source_rel_support,
+                pos_embed=pos_embed,
+                selected_mask=selected_mask,
+                source_quality=source_quality,
+                target_low=target_low,
+            )
+
+            inactive = active <= 0.0
+
+            # 已选候选不能重复选择；已停止窗口的所有候选也全部屏蔽。
+            invalid_candidate = selected_mask | inactive.unsqueeze(-1)
+            candidate_logits = candidate_logits.masked_fill(
+                invalid_candidate, -1.0e4
+            )
+
+            # 已停止窗口强制保持 STOP，不再使用 Python if 判断 GPU 张量。
+            stop_logit = torch.where(
+                inactive.unsqueeze(-1),
+                torch.zeros_like(stop_logit),
+                stop_logit,
+            )
+            logits = torch.cat([candidate_logits, stop_logit], dim=-1)
+
+            choice = self._hard_or_st_choice(logits)
+            candidate_weight = (
+                choice[..., : self.num_candidates] * active.unsqueeze(-1)
+            )
+            stop_weight = choice[..., -1] * active
+            choose_any = candidate_weight.sum(dim=-1)
+
+            selected_source = self._compose_selected_source(
+                source_support, candidate_weight
+            )
+            message, message_gate = attention(state, selected_source)
+
+            if low_mode == "r2i":
+                if source_candidate_low is None:
+                    low_factor = torch.ones_like(choose_any)
+                else:
+                    selected_low = (
+                        candidate_weight * source_candidate_low
+                    ).sum(dim=-1) / choose_any.clamp_min(1.0e-6)
+                    # RGB 源越暗，向 IR 注入越弱。
+                    low_factor = (
+                        1.0 - self.lambda_low * selected_low
+                    ).clamp(0.0, 1.0)
+            elif low_mode == "i2r":
+                # RGB 目标越暗，越需要 IR 提供稳定结构。
+                low_factor = 1.0 + self.lambda_low * target_low
+            else:
+                raise ValueError(f"Unknown low_mode={low_mode}")
+
+            update_scale = (
+                (choose_any * low_factor).unsqueeze(-1).unsqueeze(-1)
+                * message_gate
+            )
+            state = state + update_scale * message
+
+            # 用硬决策更新后续轮次的候选屏蔽和活动状态。
+            hard_selected = candidate_weight.detach() > 0.5
+            selected_mask = selected_mask | hard_selected
+            selected_count = selected_count + (
+                choose_any.detach() > 0.5
+            ).to(selected_count.dtype)
+            active = active * (
+                1.0 - (stop_weight.detach() > 0.5).to(active.dtype)
+            )
+
+            # 仅推理时允许整体提前退出；训练时不做设备同步。
+            if not self.training and bool((active <= 0.0).all()):
+                break
+
+        return state, selected_count
+
+    def forward(self, x: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(x, (list, tuple)) or len(x) < 2:
+            raise TypeError(
+                "ProgressiveSCI expects [rgb_feat, ir_feat, optional_rgb_raw]"
+            )
+
+        rgb, ir = x[0], x[1]
+        rgb_raw = x[2] if len(x) > 2 else None
+
+        if rgb.shape != ir.shape:
+            raise ValueError(
+                f"RGB/IR feature shapes must match, got {tuple(rgb.shape)} "
+                f"vs {tuple(ir.shape)}"
+            )
+        b, c, h, w = rgb.shape
+        if c != self.c:
+            raise ValueError(f"Expected input channels={self.c}, got {c}")
+
+        # 1) 两个模态独立投影到交互嵌入空间。
+        rgb_e = self.rgb_in(rgb)
+        ir_e = self.ir_in(ir)
+
+        # 2) 将 H/W 补到中心窗口整数倍；输出时裁回。
+        rgb_e, pad_hw = _psci_pad_to_multiple(rgb_e, self.center_win)
+        ir_e, pad_hw_ir = _psci_pad_to_multiple(ir_e, self.center_win)
+        if pad_hw_ir != pad_hw:
+            raise RuntimeError("RGB and IR produced inconsistent padding")
+
+        # 3) 构造不重叠中心窗口和固定源支持域。
+        rgb_center, gh, gw = _psci_partition_nonoverlap(
+            rgb_e, self.center_win
+        )
+        ir_center, gh_ir, gw_ir = _psci_partition_nonoverlap(
+            ir_e, self.center_win
+        )
+        if (gh, gw) != (gh_ir, gw_ir):
+            raise RuntimeError("RGB/IR window grids are inconsistent")
+
+        rgb_support = _psci_extract_support(
+            rgb_e, self.center_win, self.support_size
+        )
+        ir_support = _psci_extract_support(
+            ir_e, self.center_win, self.support_size
+        )
+
+        # 4) 构造 RGB 局部低照度信息。
+        low_map = _psci_luminance_low_map(rgb_raw, (h, w), rgb)
+        if low_map is not None:
+            low_map, _ = _psci_pad_to_multiple(low_map, self.center_win)
+            low_center, _, _ = _psci_partition_nonoverlap(
+                low_map, self.center_win
+            )
+            low_center = low_center.mean(dim=(2, 3))
+            low_support = _psci_extract_support(
+                low_map, self.center_win, self.support_size
+            )
+        else:
+            low_center = torch.zeros(
+                b, gh * gw, device=rgb.device, dtype=rgb_e.dtype
+            )
+            low_support = None
+
+        rgb_candidate_low = self._candidate_low_values(
+            low_support,
+            b=b,
+            l=gh * gw,
+            device=rgb_e.device,
+            dtype=rgb_e.dtype,
+        )
+        rgb_source_quality = 1.0 - rgb_candidate_low
+        ir_source_quality = torch.ones_like(rgb_source_quality)
+
+        # 5) 平行双向渐进交互。
+        # RGB→IR：固定读取原始 rgb_support，更新 IR 中心状态。
+        ir_state, count_r2i = self._run_direction(
+            target_initial=ir_center,
+            source_support=rgb_support,
+            estimator=self.value_r2i,
+            attention=self.attn_r2i,
+            source_quality=rgb_source_quality,
+            target_low=low_center,
+            low_mode="r2i",
+            source_candidate_low=rgb_candidate_low,
+        )
+
+        # IR→RGB：固定读取原始 ir_support，更新 RGB 中心状态。
+        rgb_state, count_i2r = self._run_direction(
+            target_initial=rgb_center,
+            source_support=ir_support,
+            estimator=self.value_i2r,
+            attention=self.attn_i2r,
+            source_quality=ir_source_quality,
+            target_low=low_center,
+            low_mode="i2r",
+            source_candidate_low=None,
+        )
+
+        # 6) 只将交互产生的增量投影回原通道并残差注入原分支。
+        rgb_delta = rgb_state - rgb_center
+        ir_delta = ir_state - ir_center
+
+        rgb_delta = _psci_reverse_nonoverlap(
+            rgb_delta, gh, gw, self.center_win
+        )
+        ir_delta = _psci_reverse_nonoverlap(
+            ir_delta, gh, gw, self.center_win
+        )
+        rgb_delta = _psci_remove_pad(rgb_delta, pad_hw)
+        ir_delta = _psci_remove_pad(ir_delta, pad_hw)
+
+        rgb_out = rgb + self.gamma_rgb.to(rgb.dtype) * self.rgb_out(
+            rgb_delta
+        ).to(rgb.dtype)
+        ir_out = ir + self.gamma_ir.to(ir.dtype) * self.ir_out(
+            ir_delta
+        ).to(ir.dtype)
+
+        if self.debug_enabled:
+            # 只在显式开启调试时同步读取统计量。
+            self.last_debug = {
+                "mean_selected_r2i": float(count_r2i.detach().mean().item()),
+                "mean_selected_i2r": float(count_i2r.detach().mean().item()),
+                "grid_hw": (gh, gw),
+                "input_hw": (h, w),
+                "pad_hw": pad_hw,
+            }
+
+        return rgb_out, ir_out
+
+
+class SCISelect(nn.Module):
+    """
+    从 ProgressiveSCI 输出的 (rgb, ir) 元组中取一条分支。
+
+    YAML：
+        - [pair_layer, 1, SCISelect, [0]]  # RGB
+        - [pair_layer, 1, SCISelect, [1]]  # IR
+    """
+
+    def __init__(self, index: int = 0):
+        super().__init__()
+        if index not in (0, 1):
+            raise ValueError("SCISelect index must be 0 (RGB) or 1 (IR)")
+        self.index = index
+
+    def forward(self, x: Sequence[torch.Tensor]) -> torch.Tensor:
+        if not isinstance(x, (list, tuple)) or len(x) != 2:
+            raise TypeError(
+                "SCISelect expects the (rgb, ir) tuple from ProgressiveSCI"
+            )
+        return x[self.index]
+
+
+class SCIPairFuse(nn.Module):
+    """
+    将 ProgressiveSCI 的双路增强特征融合为送入 YOLO Neck 的单路特征。
+
+    mode="add"：直接相加；
+    mode="concat"：拼接后使用 1×1 Conv-BN-SiLU 压回 c 通道。
+    """
+
+    def __init__(self, c: int, mode: str = "add"):
+        super().__init__()
+        mode = str(mode).lower()
+        if mode not in {"add", "concat"}:
+            raise ValueError("SCIPairFuse mode must be 'add' or 'concat'")
+        self.mode = mode
+
+        if mode == "concat":
+            self.fuse = nn.Sequential(
+                nn.Conv2d(c * 2, c, 1, bias=False),
+                nn.BatchNorm2d(c),
+                nn.SiLU(),
+            )
+        else:
+            self.fuse = nn.Identity()
+
+    def forward(self, x: Sequence[torch.Tensor]) -> torch.Tensor:
+        if not isinstance(x, (list, tuple)) or len(x) != 2:
+            raise TypeError(
+                "SCIPairFuse expects the (rgb, ir) tuple from ProgressiveSCI"
+            )
+        rgb, ir = x
+        if self.mode == "add":
+            return rgb + ir
+        return self.fuse(torch.cat([rgb, ir], dim=1))
+
+
+
+# ============================================================
+# FRCSF: Frequency Restructuring and Cross-modal State Fusion
+# ============================================================
+
+class HaarDWT2D(nn.Module):
+    """Fixed orthonormal 2D Haar DWT for BxCxHxW feature maps."""
+
+    def __init__(self):
+        super().__init__()
+        s = 1.0 / math.sqrt(2.0)
+        low = torch.tensor([s, s], dtype=torch.float32)
+        high = torch.tensor([-s, s], dtype=torch.float32)
+        kernels = torch.stack(
+            [
+                torch.outer(low, low),    # LL
+                torch.outer(low, high),   # LH
+                torch.outer(high, low),   # HL
+                torch.outer(high, high),  # HH
+            ],
+            dim=0,
+        ).unsqueeze(1)  # [4, 1, 2, 2]
+        self.register_buffer("haar_kernels", kernels, persistent=False)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        pad_h = H % 2
+        pad_w = W % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+
+        weight = self.haar_kernels.to(device=x.device, dtype=x.dtype).repeat(C, 1, 1, 1)
+        y = F.conv2d(x, weight, stride=2, padding=0, groups=C)
+        h2, w2 = y.shape[-2:]
+        y = y.view(B, C, 4, h2, w2)
+
+        ll = y[:, :, 0].contiguous()
+        lh = y[:, :, 1].contiguous()
+        hl = y[:, :, 2].contiguous()
+        hh = y[:, :, 3].contiguous()
+        return ll, lh, hl, hh, (H, W)
+
+
+class HaarIDWT2D(nn.Module):
+    """Inverse transform paired with :class:`HaarDWT2D`."""
+
+    def __init__(self):
+        super().__init__()
+        s = 1.0 / math.sqrt(2.0)
+        low = torch.tensor([s, s], dtype=torch.float32)
+        high = torch.tensor([-s, s], dtype=torch.float32)
+        kernels = torch.stack(
+            [
+                torch.outer(low, low),
+                torch.outer(low, high),
+                torch.outer(high, low),
+                torch.outer(high, high),
+            ],
+            dim=0,
+        ).unsqueeze(1)
+        self.register_buffer("haar_kernels", kernels, persistent=False)
+
+    def forward(self, ll, lh, hl, hh, output_hw=None):
+        B, C, H, W = ll.shape
+        bands = torch.stack([ll, lh, hl, hh], dim=2).reshape(B, C * 4, H, W)
+        weight = self.haar_kernels.to(device=ll.device, dtype=ll.dtype).repeat(C, 1, 1, 1)
+        x = F.conv_transpose2d(bands, weight, stride=2, padding=0, groups=C)
+
+        if output_hw is not None:
+            out_h, out_w = output_hw
+            x = x[:, :, :out_h, :out_w].contiguous()
+        return x
+
+
+class LowFrequencyEnhancement(nn.Module):
+    """
+    Stage-1 low-frequency enhancement.
+
+    Default: parallel 3x3 / 5x5 / 7x7 convolutions, concatenate, then 1x1 projection.
+    Ablation switch:
+        mode="standard"  -> ordinary convolutions (default / first version)
+        mode="depthwise" -> DWConv + PWConv lightweight variant
+    """
+
+    def __init__(self, channels, mode="standard"):
+        super().__init__()
+        if mode not in {"standard", "depthwise"}:
+            raise ValueError(f"Unsupported low-frequency mode: {mode}")
+        self.mode = mode
+
+        def make_branch(k):
+            if mode == "standard":
+                return nn.Sequential(
+                    nn.Conv2d(channels, channels, k, padding=k // 2, bias=False),
+                    nn.BatchNorm2d(channels),
+                    nn.SiLU(inplace=True),
+                )
+            return nn.Sequential(
+                nn.Conv2d(channels, channels, k, padding=k // 2, groups=channels, bias=False),
+                nn.BatchNorm2d(channels),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(channels, channels, 1, bias=False),
+                nn.BatchNorm2d(channels),
+                nn.SiLU(inplace=True),
+            )
+
+        self.branch3 = make_branch(3)
+        self.branch5 = make_branch(5)
+        self.branch7 = make_branch(7)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        x3 = self.branch3(x)
+        x5 = self.branch5(x)
+        x7 = self.branch7(x)
+        return self.fuse(torch.cat([x3, x5, x7], dim=1))
+
+
+class HighFrequencyEnhancement(nn.Module):
+    """
+    Stage-1 MGFF-style high-frequency spatial selection.
+
+    Channel AvgPool + MaxPool -> concat -> 1x1 conv -> sigmoid spatial weight.
+
+    Default / first version:
+        mode="multiply": F' = A * F
+
+    Ablation:
+        mode="residual": F' = F + A * F
+    """
+
+    def __init__(self, mode="multiply"):
+        super().__init__()
+        if mode not in {"multiply", "residual"}:
+            raise ValueError(f"Unsupported high-frequency mode: {mode}")
+        self.mode = mode
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        avg_map = x.mean(dim=1, keepdim=True)
+        max_map = x.amax(dim=1, keepdim=True)
+        attn = self.spatial_gate(torch.cat([avg_map, max_map], dim=1))
+        if self.mode == "multiply":
+            return attn * x
+        return x + attn * x
+
+
+class IntraModalFrequencyEnhancement(nn.Module):
+    """Stage 1: frequency-specific enhancement inside one modality only."""
+
+    def __init__(self, channels, lf_mode="standard", hf_mode="multiply"):
+        super().__init__()
+        self.low = LowFrequencyEnhancement(channels, mode=lf_mode)
+        # Directional high-frequency bands stay separate and use independent tiny gates.
+        self.high_lh = HighFrequencyEnhancement(mode=hf_mode)
+        self.high_hl = HighFrequencyEnhancement(mode=hf_mode)
+        self.high_hh = HighFrequencyEnhancement(mode=hf_mode)
+
+    def forward(self, bands):
+        ll, lh, hl, hh = bands
+        return (
+            self.low(ll),
+            self.high_lh(lh),
+            self.high_hl(hl),
+            self.high_hh(hh),
+        )
+
+
+class FactorizedBilinearInteraction(nn.Module):
+    """
+    Stage-2 factorized same-frequency bilinear interaction.
+
+    For one frequency band:
+        A_rgb = U_rgb(X_rgb), A_ir = U_ir(X_ir)
+        J = A_rgb * A_ir
+        dRGB = P_rgb(J), dIR = P_ir(J)
+
+    interaction_direction:
+        "bidirectional" -> update RGB and IR (default)
+        "rgb2ir"        -> only update IR
+        "ir2rgb"        -> only update RGB
+    """
+
+    def __init__(self, channels, rank_ratio=4, interaction_direction="bidirectional"):
+        super().__init__()
+        if rank_ratio <= 0:
+            raise ValueError(f"rank_ratio must be positive, got {rank_ratio}")
+        if interaction_direction not in {"bidirectional", "rgb2ir", "ir2rgb"}:
+            raise ValueError(f"Unsupported Stage-2 direction: {interaction_direction}")
+
+        rank = max(1, channels // int(rank_ratio))
+        self.rank = rank
+        self.interaction_direction = interaction_direction
+
+        self.u_rgb = nn.Conv2d(channels, rank, 1, bias=True)
+        self.u_ir = nn.Conv2d(channels, rank, 1, bias=True)
+        self.p_rgb = nn.Conv2d(rank, channels, 1, bias=True)
+        self.p_ir = nn.Conv2d(rank, channels, 1, bias=True)
+
+    def forward(self, rgb, ir):
+        joint = self.u_rgb(rgb) * self.u_ir(ir)
+
+        if self.interaction_direction in {"bidirectional", "ir2rgb"}:
+            rgb = rgb + self.p_rgb(joint)
+        if self.interaction_direction in {"bidirectional", "rgb2ir"}:
+            ir = ir + self.p_ir(joint)
+        return rgb, ir
+
+
+class SameFrequencyInteraction(nn.Module):
+    """
+    Stage 2 wrapper.
+
+    share_mode:
+        "low_high"       : LL uses theta_L; LH/HL/HH share theta_H (default / first version)
+        "all_independent" : LL/LH/HL/HH all use independent modules
+        "all_shared"      : all four bands reuse the same interaction module
+    """
+
+    def __init__(
+        self,
+        channels,
+        rank_ratio=4,
+        share_mode="low_high",
+        interaction_direction="bidirectional",
+    ):
+        super().__init__()
+        if share_mode not in {"low_high", "all_independent", "all_shared"}:
+            raise ValueError(f"Unsupported Stage-2 share_mode: {share_mode}")
+        self.share_mode = share_mode
+
+        make_interaction = lambda: FactorizedBilinearInteraction(
+            channels,
+            rank_ratio=rank_ratio,
+            interaction_direction=interaction_direction,
+        )
+
+        if share_mode == "low_high":
+            self.low_interaction = make_interaction()
+            self.high_interaction = make_interaction()
+        elif share_mode == "all_independent":
+            self.interactions = nn.ModuleList([make_interaction() for _ in range(4)])
+        else:
+            self.shared_interaction = make_interaction()
+
+    def forward(self, rgb_bands, ir_bands):
+        if self.share_mode == "low_high":
+            rgb_ll, ir_ll = self.low_interaction(rgb_bands[0], ir_bands[0])
+            rgb_lh, ir_lh = self.high_interaction(rgb_bands[1], ir_bands[1])
+            rgb_hl, ir_hl = self.high_interaction(rgb_bands[2], ir_bands[2])
+            rgb_hh, ir_hh = self.high_interaction(rgb_bands[3], ir_bands[3])
+        elif self.share_mode == "all_independent":
+            outputs = [
+                module(rgb_band, ir_band)
+                for module, rgb_band, ir_band in zip(self.interactions, rgb_bands, ir_bands)
+            ]
+            (rgb_ll, ir_ll), (rgb_lh, ir_lh), (rgb_hl, ir_hl), (rgb_hh, ir_hh) = outputs
+        else:
+            outputs = [
+                self.shared_interaction(rgb_band, ir_band)
+                for rgb_band, ir_band in zip(rgb_bands, ir_bands)
+            ]
+            (rgb_ll, ir_ll), (rgb_lh, ir_lh), (rgb_hl, ir_hl), (rgb_hh, ir_hh) = outputs
+
+        return (rgb_ll, rgb_lh, rgb_hl, rgb_hh), (ir_ll, ir_lh, ir_hl, ir_hh)
+
+
+class _FRCSFLayerNorm2d(nn.Module):
+    def __init__(self, channels, eps=1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels, eps=eps)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = self.norm(x)
+        return x.permute(0, 3, 1, 2).contiguous()
+
+
+class CrossModalStateFusion(nn.Module):
+    """
+    Stage 3: private dual SS2D + Cross-C readout interaction.
+
+    Private per modality:
+        normalization, content projection, gate projection, DWConv,
+        x-projection (dt/B/C), dt projection, A, D, selective-scan hidden state,
+        output normalization and output projection.
+
+    Cross-modal interaction occurs ONLY on C after both modalities produce
+    their own C parameters and BEFORE selective scan.
+
+    cross_c_mode:
+        "cross"       : proposed Cross-C (default)
+        "independent" : C_rgb*=C_rgb, C_ir*=C_ir
+        "shared"      : C_rgb*=C_ir*=C_rgb+C_ir
+
+    cross_direction (only for cross_c_mode="cross"):
+        "bidirectional" : IR->RGB and RGB->IR (default)
+        "ir2rgb"        : only C_ir contributes to RGB readout
+        "rgb2ir"        : only C_rgb contributes to IR readout
+    """
+
+    def __init__(
+        self,
+        channels,
+        d_state=16,
+        ssm_ratio=1.0,
+        dt_rank="auto",
+        d_conv=3,
+        dropout=0.0,
+        cross_c_mode="cross",
+        cross_direction="bidirectional",
+        dt_min=0.001,
+        dt_max=0.1,
+        dt_scale=1.0,
+        dt_init_floor=1e-4,
+    ):
+        super().__init__()
+        if cross_c_mode not in {"cross", "independent", "shared"}:
+            raise ValueError(f"Unsupported Cross-C mode: {cross_c_mode}")
+        if cross_direction not in {"bidirectional", "ir2rgb", "rgb2ir"}:
+            raise ValueError(f"Unsupported Cross-C direction: {cross_direction}")
+        if d_conv < 1 or d_conv % 2 == 0:
+            raise ValueError(f"d_conv must be a positive odd number, got {d_conv}")
+        if selective_scan_fn is None:
+            raise ImportError("FRCSFModule Stage 3 requires mamba_ssm selective_scan_fn.")
+
+        self.channels = channels
+        self.d_state = int(d_state)
+        self.d_inner = max(1, int(channels * ssm_ratio))
+        self.K = 4
+        self.cross_c_mode = cross_c_mode
+        self.cross_direction = cross_direction
+        self.dt_rank = math.ceil(channels / 16) if dt_rank == "auto" else int(dt_rank)
+
+        # Private pre-normalization.
+        self.norm_rgb = _FRCSFLayerNorm2d(channels)
+        self.norm_ir = _FRCSFLayerNorm2d(channels)
+
+        # Independent content/state projections.
+        self.state_proj_rgb = nn.Conv2d(channels, self.d_inner, 1, bias=False)
+        self.state_proj_ir = nn.Conv2d(channels, self.d_inner, 1, bias=False)
+        self.dwconv_rgb = nn.Conv2d(
+            self.d_inner, self.d_inner, d_conv,
+            padding=d_conv // 2, groups=self.d_inner, bias=True,
+        )
+        self.dwconv_ir = nn.Conv2d(
+            self.d_inner, self.d_inner, d_conv,
+            padding=d_conv // 2, groups=self.d_inner, bias=True,
+        )
+
+        # Independent Mamba output gates: not cross-modal reliability gates.
+        self.gate_proj_rgb = nn.Conv2d(channels, self.d_inner, 1, bias=False)
+        self.gate_proj_ir = nn.Conv2d(channels, self.d_inner, 1, bias=False)
+        self.act = nn.SiLU()
+
+        proj_out_dim = self.dt_rank + 2 * self.d_state
+
+        # Private x-projections: each direction produces dt, B, C.
+        self.x_proj_rgb_weight = nn.Parameter(torch.empty(self.K, proj_out_dim, self.d_inner))
+        self.x_proj_ir_weight = nn.Parameter(torch.empty(self.K, proj_out_dim, self.d_inner))
+
+        # Private dt projections.
+        self.dt_proj_rgb_weight = nn.Parameter(torch.empty(self.K, self.d_inner, self.dt_rank))
+        self.dt_proj_ir_weight = nn.Parameter(torch.empty(self.K, self.d_inner, self.dt_rank))
+        self.dt_proj_rgb_bias = nn.Parameter(torch.empty(self.K, self.d_inner))
+        self.dt_proj_ir_bias = nn.Parameter(torch.empty(self.K, self.d_inner))
+
+        # Private A and D. Hidden states are private because scans are invoked separately.
+        A = torch.arange(1, self.d_state + 1, dtype=torch.float32)
+        A = A.view(1, 1, self.d_state).repeat(self.K, self.d_inner, 1)
+        self.A_logs_rgb = nn.Parameter(torch.log(A).reshape(self.K * self.d_inner, self.d_state))
+        self.A_logs_ir = nn.Parameter(torch.log(A.clone()).reshape(self.K * self.d_inner, self.d_state))
+        self.Ds_rgb = nn.Parameter(torch.ones(self.K * self.d_inner))
+        self.Ds_ir = nn.Parameter(torch.ones(self.K * self.d_inner))
+
+        # Cross-C coefficients: zero initialization => exact Independent-C at initialization.
+        self.a_i2r = nn.Parameter(torch.zeros(1))
+        self.a_r2i = nn.Parameter(torch.zeros(1))
+
+        # Private output normalization / projection.
+        self.out_norm_rgb = nn.LayerNorm(self.d_inner)
+        self.out_norm_ir = nn.LayerNorm(self.d_inner)
+        self.out_proj_rgb = nn.Conv2d(self.d_inner, channels, 1, bias=True)
+        self.out_proj_ir = nn.Conv2d(self.d_inner, channels, 1, bias=True)
+        self.dropout_rgb = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.dropout_ir = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        self._init_weights(dt_min, dt_max, dt_scale, dt_init_floor)
+
+    def _init_dt_one(self, weight, bias, dt_min, dt_max, dt_scale, dt_init_floor):
+        std = (self.dt_rank ** -0.5) * dt_scale
+        nn.init.uniform_(weight, -std, std)
+
+        dt = torch.exp(
+            torch.rand(self.K, self.d_inner)
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            bias.copy_(inv_dt)
+
+    def _init_weights(self, dt_min, dt_max, dt_scale, dt_init_floor):
+        nn.init.xavier_uniform_(self.x_proj_rgb_weight)
+        nn.init.xavier_uniform_(self.x_proj_ir_weight)
+        self._init_dt_one(
+            self.dt_proj_rgb_weight,
+            self.dt_proj_rgb_bias,
+            dt_min,
+            dt_max,
+            dt_scale,
+            dt_init_floor,
+        )
+        self._init_dt_one(
+            self.dt_proj_ir_weight,
+            self.dt_proj_ir_bias,
+            dt_min,
+            dt_max,
+            dt_scale,
+            dt_init_floor,
+        )
+
+    @staticmethod
+    def _cross_scan(x):
+        """
+        BxCxHxW -> Bx4xCxL.
+        0: left->right, 1: right->left, 2: top->bottom, 3: bottom->top.
+        """
+        x_lr = x.flatten(2)
+        x_rl = torch.flip(x, dims=[3]).flatten(2)
+        x_tb = x.transpose(2, 3).contiguous().flatten(2)
+        x_bt = torch.flip(x, dims=[2]).transpose(2, 3).contiguous().flatten(2)
+        return torch.stack([x_lr, x_rl, x_tb, x_bt], dim=1)
+
+    @staticmethod
+    def _cross_merge(ys, H, W):
+        B, K, C, L = ys.shape
+        assert K == 4
+
+        y_lr = ys[:, 0].reshape(B, C, H, W)
+        y_rl = torch.flip(ys[:, 1].reshape(B, C, H, W), dims=[3])
+
+        y_tb = ys[:, 2].reshape(B, C, W, H).transpose(2, 3).contiguous()
+        y_bt = ys[:, 3].reshape(B, C, W, H).transpose(2, 3).contiguous()
+        y_bt = torch.flip(y_bt, dims=[2])
+
+        return (y_lr + y_rl + y_tb + y_bt) * 0.25
+
+    def _project_ssm_params(self, xs, x_proj_weight, dt_proj_weight, dt_proj_bias):
+        """Generate modality-private dt, B and C for four matching scan directions."""
+        B, K, D, L = xs.shape
+        x_dbl = torch.einsum("bkdl,kcd->bkcl", xs, x_proj_weight)
+        dts, Bs, Cs = torch.split(
+            x_dbl,
+            [self.dt_rank, self.d_state, self.d_state],
+            dim=2,
+        )
+        dts = torch.einsum("bkrl,kdr->bkdl", dts, dt_proj_weight)
+        dts = dts + dt_proj_bias.view(1, K, D, 1)
+        return dts, Bs.contiguous(), Cs.contiguous()
+
+    def _mix_cross_c(self, c_rgb, c_ir):
+        # IMPORTANT: compute both from the original C tensors; never update in-place.
+        if self.cross_c_mode == "independent":
+            return c_rgb, c_ir
+
+        if self.cross_c_mode == "shared":
+            c_shared = c_rgb + c_ir
+            return c_shared, c_shared
+
+        alpha = torch.tanh(self.a_i2r)
+        beta = torch.tanh(self.a_r2i)
+
+        if self.cross_direction == "bidirectional":
+            c_rgb_star = c_rgb + alpha * c_ir
+            c_ir_star = c_ir + beta * c_rgb
+        elif self.cross_direction == "ir2rgb":
+            c_rgb_star = c_rgb + alpha * c_ir
+            c_ir_star = c_ir
+        else:  # rgb2ir
+            c_rgb_star = c_rgb
+            c_ir_star = c_ir + beta * c_rgb
+        return c_rgb_star, c_ir_star
+
+    def _selective_scan_one(self, xs, dts, Bs, Cs, A_logs, Ds):
+        B, K, D, L = xs.shape
+        xs_scan = xs.reshape(B, K * D, L)
+        dts_scan = dts.reshape(B, K * D, L)
+        As = -torch.exp(A_logs.float())
+        Ds = Ds.float()
+
+        y = selective_scan_fn(
+            xs_scan.float(),
+            dts_scan.float(),
+            As,
+            Bs.float(),
+            Cs.float(),
+            Ds,
+            z=None,
+            delta_bias=None,
+            delta_softplus=True,
+            return_last_state=False,
+        )
+        return y.reshape(B, K, D, L).to(xs.dtype)
+
+    @staticmethod
+    def _apply_out_norm(y, norm):
+        B, C, H, W = y.shape
+        y = y.flatten(2).transpose(1, 2).contiguous()
+        y = norm(y)
+        return y.transpose(1, 2).reshape(B, C, H, W).contiguous()
+
+    def forward(self, rgb, ir):
+        if rgb.shape != ir.shape:
+            raise ValueError(f"CrossModalStateFusion expects equal RGB/IR shapes, got {rgb.shape} vs {ir.shape}")
+
+        B, C, H, W = rgb.shape
+        rgb_skip = rgb
+        ir_skip = ir
+
+        rgb_n = self.norm_rgb(rgb)
+        ir_n = self.norm_ir(ir)
+
+        u_rgb = self.act(self.dwconv_rgb(self.state_proj_rgb(rgb_n)))
+        u_ir = self.act(self.dwconv_ir(self.state_proj_ir(ir_n)))
+        g_rgb = self.act(self.gate_proj_rgb(rgb_n))
+        g_ir = self.act(self.gate_proj_ir(ir_n))
+
+        # Ultralytics builds model strides once with a CPU dummy tensor.
+        # mamba_ssm selective_scan is CUDA-dependent in this project, so only
+        # that build-time path bypasses state scanning while preserving shape.
+        if not rgb.is_cuda:
+            return rgb_skip, ir_skip
+
+        xs_rgb = self._cross_scan(u_rgb)
+        xs_ir = self._cross_scan(u_ir)
+
+        dt_rgb, B_rgb, C_rgb = self._project_ssm_params(
+            xs_rgb,
+            self.x_proj_rgb_weight,
+            self.dt_proj_rgb_weight,
+            self.dt_proj_rgb_bias,
+        )
+        dt_ir, B_ir, C_ir = self._project_ssm_params(
+            xs_ir,
+            self.x_proj_ir_weight,
+            self.dt_proj_ir_weight,
+            self.dt_proj_ir_bias,
+        )
+
+        # The ONLY cross-modal state-space interaction.
+        C_rgb_star, C_ir_star = self._mix_cross_c(C_rgb, C_ir)
+
+        ys_rgb = self._selective_scan_one(
+            xs_rgb, dt_rgb, B_rgb, C_rgb_star, self.A_logs_rgb, self.Ds_rgb
+        )
+        ys_ir = self._selective_scan_one(
+            xs_ir, dt_ir, B_ir, C_ir_star, self.A_logs_ir, self.Ds_ir
+        )
+
+        y_rgb = self._cross_merge(ys_rgb, H, W)
+        y_ir = self._cross_merge(ys_ir, H, W)
+
+        y_rgb = self._apply_out_norm(y_rgb, self.out_norm_rgb)
+        y_ir = self._apply_out_norm(y_ir, self.out_norm_ir)
+
+        y_rgb = self.dropout_rgb(self.out_proj_rgb(y_rgb * g_rgb))
+        y_ir = self.dropout_ir(self.out_proj_ir(y_ir * g_ir))
+
+        return rgb_skip + y_rgb, ir_skip + y_ir
+
+
+class FRCSFModule(nn.Module):
+    """
+    Frequency Restructuring and Cross-modal State Fusion Module.
+
+    First-version/default path:
+        1) fixed Haar DWT on RGB and IR separately;
+        2) LL multi-scale intra-modal enhancement;
+        3) MGFF-style multiplicative enhancement on LH/HL/HH separately;
+        4) same-frequency factorized bilinear interaction:
+           theta_L for LL, one shared theta_H reused for LH/HL/HH, rank=C/4;
+        5) separate Haar IDWT for RGB and IR;
+        6) private dual four-direction SS2D with Cross-C only;
+        7) modality-private residual outputs;
+        8) concat + 1x1 projection to one fused feature.
+
+    YAML arguments (channel c is inferred by tasks.py and must NOT be written):
+        [rank_ratio, d_state, ssm_ratio, dt_rank, d_conv, dropout,
+         lf_mode, hf_mode, stage2_share_mode, stage2_direction,
+         cross_c_mode, cross_direction, fusion_mode]
+
+    Recommended first version:
+        [4, 16, 1.0, "auto", 3, 0.0,
+         "standard", "multiply", "low_high", "bidirectional",
+         "cross", "bidirectional", "concat"]
+
+    Main ablation switches:
+        hf_mode="residual"                      -> residual HF enhancement
+        rank_ratio=8 / 2                         -> C/8 / C/2
+        stage2_share_mode="all_independent"     -> four independent Stage-2 modules
+        stage2_share_mode="all_shared"          -> all bands share one Stage-2 module
+        stage2_direction="rgb2ir" / "ir2rgb"   -> one-way Stage-2 interaction
+        cross_c_mode="independent"              -> remove Cross-C
+        cross_c_mode="shared"                   -> Shared-C
+        cross_direction="rgb2ir" / "ir2rgb"    -> one-way Cross-C
+        fusion_mode="add"                       -> Add + 3x3 projection
+    """
+
+    def __init__(
+        self,
+        c,
+        rank_ratio=4,
+        d_state=16,
+        ssm_ratio=1.0,
+        dt_rank="auto",
+        d_conv=3,
+        dropout=0.0,
+        lf_mode="standard",
+        hf_mode="multiply",
+        stage2_share_mode="low_high",
+        stage2_direction="bidirectional",
+        cross_c_mode="cross",
+        cross_direction="bidirectional",
+        fusion_mode="concat",
+    ):
+        super().__init__()
+        if fusion_mode not in {"concat", "add"}:
+            raise ValueError(f"Unsupported FRCSF fusion_mode: {fusion_mode}")
+        self.channels = c
+        self.fusion_mode = fusion_mode
+
+        self.dwt = HaarDWT2D()
+        self.idwt = HaarIDWT2D()
+
+        # Stage 1: RGB and IR are strictly modality-private.
+        self.stage1_rgb = IntraModalFrequencyEnhancement(c, lf_mode=lf_mode, hf_mode=hf_mode)
+        self.stage1_ir = IntraModalFrequencyEnhancement(c, lf_mode=lf_mode, hf_mode=hf_mode)
+
+        # Stage 2: only matching frequency bands interact.
+        self.stage2 = SameFrequencyInteraction(
+            c,
+            rank_ratio=rank_ratio,
+            share_mode=stage2_share_mode,
+            interaction_direction=stage2_direction,
+        )
+
+        # Stage 3: private state evolution + Cross-C readout.
+        self.stage3 = CrossModalStateFusion(
+            c,
+            d_state=d_state,
+            ssm_ratio=ssm_ratio,
+            dt_rank=dt_rank,
+            d_conv=d_conv,
+            dropout=dropout,
+            cross_c_mode=cross_c_mode,
+            cross_direction=cross_direction,
+        )
+
+        if fusion_mode == "concat":
+            self.final_proj = nn.Conv2d(c * 2, c, 1, bias=True)
+        else:
+            # Ablation from the design: Add + 3x3 projection.
+            self.final_proj = nn.Conv2d(c, c, 3, padding=1, bias=True)
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != 2:
+            raise ValueError("FRCSFModule expects [rgb_feature, ir_feature].")
+        rgb, ir = x
+        if rgb.shape != ir.shape:
+            raise ValueError(f"FRCSFModule RGB/IR shape mismatch: {rgb.shape} vs {ir.shape}")
+
+        # -------------------- DWT --------------------
+        rgb_ll, rgb_lh, rgb_hl, rgb_hh, rgb_hw = self.dwt(rgb)
+        ir_ll, ir_lh, ir_hl, ir_hh, ir_hw = self.dwt(ir)
+        if rgb_hw != ir_hw:
+            raise ValueError(f"FRCSFModule RGB/IR spatial mismatch: {rgb_hw} vs {ir_hw}")
+
+        # -------------------- Stage 1 --------------------
+        rgb_bands = self.stage1_rgb((rgb_ll, rgb_lh, rgb_hl, rgb_hh))
+        ir_bands = self.stage1_ir((ir_ll, ir_lh, ir_hl, ir_hh))
+
+        # -------------------- Stage 2 --------------------
+        rgb_bands, ir_bands = self.stage2(rgb_bands, ir_bands)
+
+        # -------------------- IDWT --------------------
+        rgb_restructured = self.idwt(*rgb_bands, output_hw=rgb_hw)
+        ir_restructured = self.idwt(*ir_bands, output_hw=ir_hw)
+
+        # -------------------- Stage 3 --------------------
+        rgb_state, ir_state = self.stage3(rgb_restructured, ir_restructured)
+
+        # -------------------- Final fusion --------------------
+        if self.fusion_mode == "concat":
+            return self.final_proj(torch.cat([rgb_state, ir_state], dim=1))
+        return self.final_proj(rgb_state + ir_state)
+
+
+"""
+Frequency-domain Mixture-of-Experts fusion for two-stream RGB/IR detection.
+
+Two experimental variants are provided:
+    1) FreqMoERouterSpecific
+       - LL: independent router + independent expert bank
+       - LH/HL/HH: independent routers + one shared high-frequency expert bank
+
+    2) FreqMoEFullIndependent
+       - LL/LH/HL/HH: four fully independent routers + expert banks
+
+The module follows the agreed pipeline:
+    RGB/IR features
+      -> fixed Haar DWT
+      -> modality-specific frequency enhancement (no BN)
+      -> same-frequency RGB/IR MoE fusion
+      -> fixed Haar IDWT
+      -> one fused spatial feature
+
+MoE auxiliary statistics are cached on the top-level fusion module and are
+collected by the modified ultralytics/utils/loss.py during OBB training.
+"""
+
+
+# -----------------------------------------------------------------------------
+# Fixed Haar wavelet transform
+# -----------------------------------------------------------------------------
+
+class HaarDWT2D(nn.Module):
+    """Fixed orthonormal 2-D Haar DWT implemented by 2x2 slicing."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim != 4:
+            raise ValueError(f"HaarDWT2D expects [B,C,H,W], got {tuple(x.shape)}")
+
+        h0, w0 = x.shape[-2:]
+        pad_h = h0 & 1
+        pad_w = w0 & 1
+        if pad_h or pad_w:
+            # Only right/bottom padding is required. Replicate is safe even for H/W=1.
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+
+        a = x[..., 0::2, 0::2]
+        b = x[..., 0::2, 1::2]
+        c = x[..., 1::2, 0::2]
+        d = x[..., 1::2, 1::2]
+
+        # Orthonormal Haar basis; factor 1/2 comes from two 1/sqrt(2) filters.
+        ll = (a + b + c + d) * 0.5
+        lh = (-a - b + c + d) * 0.5
+        hl = (-a + b - c + d) * 0.5
+        hh = (a - b - c + d) * 0.5
+        return (ll, lh, hl, hh), (h0, w0)
+
+
+class HaarIDWT2D(nn.Module):
+    """Exact inverse of HaarDWT2D."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        coeffs: Sequence[torch.Tensor],
+        output_hw: Tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        if len(coeffs) != 4:
+            raise ValueError(f"HaarIDWT2D expects four subbands, got {len(coeffs)}")
+        ll, lh, hl, hh = coeffs
+        if not (ll.shape == lh.shape == hl.shape == hh.shape):
+            raise ValueError("LL/LH/HL/HH must have identical shapes for IDWT")
+
+        a = (ll - lh - hl + hh) * 0.5
+        b = (ll - lh + hl - hh) * 0.5
+        c = (ll + lh - hl - hh) * 0.5
+        d = (ll + lh + hl + hh) * 0.5
+
+        bsz, ch, h, w = ll.shape
+        out = ll.new_empty((bsz, ch, h * 2, w * 2))
+        out[..., 0::2, 0::2] = a
+        out[..., 0::2, 1::2] = b
+        out[..., 1::2, 0::2] = c
+        out[..., 1::2, 1::2] = d
+
+        if output_hw is not None:
+            oh, ow = output_hw
+            out = out[..., :oh, :ow]
+        return out
+
+
+# -----------------------------------------------------------------------------
+# Stage 1: modality-specific frequency enhancement (no BatchNorm)
+# -----------------------------------------------------------------------------
+
+class LowFrequencyEnhance(nn.Module):
+    """
+    Lightweight MGFF-inspired low-frequency multi-granularity refinement.
+
+    Instead of full C->C 3x3/5x5/7x7 convolutions with BN, use depthwise
+    3x3/5x5/7x7 branches and learn only three scalar branch weights.
+    A small residual scale keeps the LL path close to the original coefficient
+    at the beginning of training.
+    """
+
+    def __init__(self, channels: int, gamma_init: float = 0.05):
+        super().__init__()
+        self.branches = nn.ModuleList(
+            [
+                nn.Conv2d(channels, channels, k, padding=k // 2, groups=channels, bias=False)
+                for k in (3, 5, 7)
+            ]
+        )
+        self.branch_logits = nn.Parameter(torch.zeros(3))
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        alpha = torch.softmax(self.branch_logits, dim=0).to(dtype=x.dtype)
+        delta = sum(a * branch(x) for a, branch in zip(alpha, self.branches))
+        return x + self.gamma.to(dtype=x.dtype) * delta
+
+
+class HighFrequencyGate(nn.Module):
+    """
+    MGFF-style multiplicative high-frequency selection.
+
+    The gate is estimated from the magnitude |H| to avoid cancellation between
+    positive and negative wavelet coefficients, while the gate is multiplied
+    back onto the original signed coefficient H.
+
+    No BN and no residual bypass are used:
+        H_enhanced = A(H) * H
+    """
+
+    def __init__(self, gate_bias_init: float = 1.0):
+        super().__init__()
+        self.gate = nn.Conv2d(2, 1, kernel_size=1, bias=True)
+        # Start from a spatially uniform but not overly suppressive gate.
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, float(gate_bias_init))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mag = x.abs()
+        avg_map = mag.mean(dim=1, keepdim=True)
+        max_map = mag.amax(dim=1, keepdim=True)
+        attn = torch.sigmoid(self.gate(torch.cat([avg_map, max_map], dim=1)))
+        return x * attn
+
+
+class ModalityFrequencyEnhance(nn.Module):
+    """One modality's LL/LH/HL/HH enhancement; all subband modules are independent."""
+
+    def __init__(self, channels: int, ll_gamma_init: float = 0.05, hf_gate_bias_init: float = 1.0):
+        super().__init__()
+        self.ll = LowFrequencyEnhance(channels, gamma_init=ll_gamma_init)
+        # Three directional high-frequency bands use independent tiny gates.
+        self.lh = HighFrequencyGate(hf_gate_bias_init)
+        self.hl = HighFrequencyGate(hf_gate_bias_init)
+        self.hh = HighFrequencyGate(hf_gate_bias_init)
+
+    def forward(self, coeffs: Sequence[torch.Tensor]):
+        ll, lh, hl, hh = coeffs
+        return self.ll(ll), self.lh(lh), self.hl(hl), self.hh(hh)
+
+
+# -----------------------------------------------------------------------------
+# Stage 2: FDA-inspired modality-aware router and lightweight Fusion Masters
+# -----------------------------------------------------------------------------
+
+class ModalityAwareRouter(nn.Module):
+    """
+    RGB/IR joint Top-K router.
+
+    signed mode:
+        descriptor = GAP(X) + GMP(X)
+
+    magnitude mode:
+        descriptor = GAP(|X|) + GMP(|X|)
+
+    RGB/IR descriptors are kept separate before concatenation.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        num_experts: int = 4,
+        top_k: int = 2,
+        init_std: float = 0.01,
+        use_abs_descriptor: bool = False,
+    ):
+        super().__init__()
+
+        if num_experts < 1:
+            raise ValueError("num_experts must be >= 1")
+
+        if not (1 <= top_k <= num_experts):
+            raise ValueError(
+                f"top_k must satisfy 1 <= top_k <= num_experts, "
+                f"got {top_k}/{num_experts}"
+            )
+
+        self.num_experts = int(num_experts)
+        self.top_k = int(top_k)
+        self.use_abs_descriptor = bool(use_abs_descriptor)
+
+        self.fc = nn.Linear(
+            channels * 2,
+            self.num_experts,
+            bias=True
+        )
+
+        # 接近均匀，但避免完全相同导致固定 tie
+        nn.init.normal_(
+            self.fc.weight,
+            mean=0.0,
+            std=float(init_std)
+        )
+        nn.init.zeros_(self.fc.bias)
+
+    def _descriptor(self, x: torch.Tensor) -> torch.Tensor:
+        # 高频实验使用幅值统计，避免 signed coefficient 正负抵消
+        if self.use_abs_descriptor:
+            x = x.abs()
+
+        avg = F.adaptive_avg_pool2d(x, 1).flatten(1)
+        mx = F.adaptive_max_pool2d(x, 1).flatten(1)
+
+        return avg + mx
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        ir: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+
+        if rgb.shape != ir.shape:
+            raise ValueError(
+                f"Router expects same RGB/IR shapes, "
+                f"got {rgb.shape} vs {ir.shape}"
+            )
+
+        dr = self._descriptor(rgb)
+        di = self._descriptor(ir)
+
+        logits = self.fc(
+            torch.cat([dr, di], dim=1)
+        )
+
+        # -----------------------------------------------------
+        # Router 概率计算统一转 FP32
+        # 避免 AMP 下 scatter FP16/FP32 dtype 冲突
+        # -----------------------------------------------------
+        routing_logits = logits.float()
+
+        # 完整 N-expert 分布
+        # 只用于 balance / debug
+        probs = torch.softmax(
+            routing_logits,
+            dim=-1
+        )
+
+        # 真正用于融合：
+        # Top-K -> selected Softmax
+        top_values, top_indices = torch.topk(
+            routing_logits,
+            k=self.top_k,
+            dim=-1
+        )
+
+        top_weights = torch.softmax(
+            top_values,
+            dim=-1
+        )
+
+        sparse_weights = torch.zeros_like(
+            routing_logits
+        )
+
+        sparse_weights.scatter_(
+            1,
+            top_indices,
+            top_weights
+        )
+
+        selected_mask = torch.zeros_like(
+            routing_logits,
+            dtype=torch.bool
+        )
+
+        selected_mask.scatter_(
+            1,
+            top_indices,
+            True
+        )
+
+        return {
+            "logits": routing_logits,
+            "probs": probs,
+            "weights": sparse_weights,
+            "mask": selected_mask,
+            "top_indices": top_indices,
+            "top_weights": top_weights,
+        }
+
+
+class ExpertBranch(nn.Module):
+    """No-BN bottleneck residual transform for one modality inside one Fusion Master."""
+
+    def __init__(self, channels: int, ratio: float = 0.25, gamma_init: float = 0.10):
+        super().__init__()
+        hidden = max(int(round(channels * float(ratio))), 8)
+        self.reduce = nn.Conv2d(channels, hidden, 1, bias=True)
+        self.dw = nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden, bias=True)
+        self.expand = nn.Conv2d(hidden, channels, 1, bias=True)
+        self.act = nn.SiLU(inplace=True)
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        delta = self.reduce(x)
+        delta = self.act(delta)
+        delta = self.dw(delta)
+        delta = self.act(delta)
+        delta = self.expand(delta)
+        return x + self.gamma.to(dtype=x.dtype) * delta
+
+
+class FusionMaster(nn.Module):
+    """
+    One homogeneous MoE expert with independent RGB/IR parameters.
+
+    RGB and IR are processed separately first, and are added only afterwards:
+        E_n(R, I) = P_n^RGB(R) + P_n^IR(I)
+
+    This is the agreed modification relative to the original FDA sum-first path.
+    """
+
+    def __init__(self, channels: int, expert_ratio: float = 0.25, gamma_init: float = 0.10):
+        super().__init__()
+        self.rgb_branch = ExpertBranch(channels, expert_ratio, gamma_init)
+        self.ir_branch = ExpertBranch(channels, expert_ratio, gamma_init)
+
+    def forward(self, rgb: torch.Tensor, ir: torch.Tensor) -> torch.Tensor:
+        return self.rgb_branch(rgb) + self.ir_branch(ir)
+
+
+class FusionExpertBank(nn.Module):
+    """A bank of homogeneous-architecture but independently parameterized Fusion Masters."""
+
+    def __init__(
+        self,
+        channels: int,
+        num_experts: int = 4,
+        expert_ratio: float = 0.25,
+        expert_gamma_init: float = 0.10,
+    ):
+        super().__init__()
+        self.num_experts = int(num_experts)
+        self.experts = nn.ModuleList(
+            [
+                FusionMaster(
+                    channels=channels,
+                    expert_ratio=expert_ratio,
+                    gamma_init=expert_gamma_init,
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        ir: torch.Tensor,
+        top_indices: torch.Tensor,
+        top_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        True sample-wise Top-K conditional execution.
+
+        Only experts selected by the router are executed for the samples assigned
+        to them. With the default N=4, K=2, each sample is processed by exactly
+        two experts instead of all four. The selected expert outputs are weighted
+        by the post-TopK Softmax weights and accumulated back to the original batch.
+        """
+        if top_indices.ndim != 2 or top_indices.shape[0] != rgb.shape[0]:
+            raise ValueError(
+                f"top_indices must be [B,K], got {tuple(top_indices.shape)} for B={rgb.shape[0]}"
+            )
+        if top_weights.shape != top_indices.shape:
+            raise ValueError(
+                f"top_weights shape must equal top_indices shape, got "
+                f"{tuple(top_weights.shape)} vs {tuple(top_indices.shape)}"
+            )
+
+        out = torch.zeros_like(rgb)
+
+        # Dispatch samples to experts. torch.topk returns unique expert indices
+        # within each sample, so each (sample, expert) pair occurs at most once.
+        for expert_id, expert in enumerate(self.experts):
+            selected = top_indices.eq(expert_id)
+            sample_idx, slot_idx = torch.where(selected)
+            if sample_idx.numel() == 0:
+                continue
+
+            rgb_sub = rgb.index_select(0, sample_idx)
+            ir_sub = ir.index_select(0, sample_idx)
+            expert_out = expert(rgb_sub, ir_sub)
+
+            w = top_weights[sample_idx, slot_idx].to(
+                device=expert_out.device,
+                dtype=expert_out.dtype
+            )
+
+            weighted = expert_out * w.view(-1, 1, 1, 1)
+
+            # One sample is selected by K experts, so contributions from different
+            # experts are summed into the corresponding batch position.
+            out = out.index_add(0, sample_idx, weighted)
+
+        return out
+
+
+# -----------------------------------------------------------------------------
+# MoE balance/debug helpers
+# -----------------------------------------------------------------------------
+
+def _balance_loss_from_routing(
+    probs: torch.Tensor,
+    selected_mask: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Switch-style balancing term adapted to Top-K routing."""
+    n = probs.shape[-1]
+    p = probs.mean(dim=0)  # sums to 1
+    # selection_rate sums to K; divide by K so f sums to 1.
+    f = selected_mask.float().mean(dim=0) / float(top_k)
+    return float(n) * torch.sum(f * p)
+
+
+def _routing_debug(
+    route_state: Dict[str, torch.Tensor],
+    bank: str,
+    route: str,
+    balance_loss: torch.Tensor,
+    feature_hw: Tuple[int, int],
+):
+    probs = route_state["probs"]
+    mask = route_state["mask"]
+    weights = route_state["weights"]
+    logits = route_state["logits"]
+    top_indices = route_state["top_indices"]
+    # -----------------------------------------------------
+    # 1. Expert selection rate
+    # Top-2 下四个 expert 的和约为 2
+    # -----------------------------------------------------
+    selection_rate = mask.float().mean(dim=0)
+    selected_count = mask.float().sum(dim=0)
+    selected_weight_mean = (
+        weights.sum(dim=0)
+        / selected_count.clamp_min(1.0)
+    )
+    # -----------------------------------------------------
+    # 2. Router entropy
+    # 归一化到 [0,1]
+    # -----------------------------------------------------
+    entropy = -(
+        probs.clamp_min(1e-9)
+        * probs.clamp_min(1e-9).log()
+    ).sum(dim=-1)
+    if probs.shape[-1] > 1:
+        entropy = entropy / math.log(
+            probs.shape[-1]
+        )
+    entropy = entropy.mean()
+    # -----------------------------------------------------
+    # 3. probability batch std
+    #
+    # 用来区分：所有样本都0.25 和：不同样本有不同偏好，只是batch mean恰好0.25
+    # -----------------------------------------------------
+    prob_std = probs.std(
+        dim=0,
+        unbiased=False
+    )
+    # -----------------------------------------------------
+    # 4. Top2 - Top3 logit margin
+    # margin≈0:
+    # Top-K 选择没有明显置信度
+    # -----------------------------------------------------
+    if logits.shape[-1] >= 3:
+        sorted_logits = torch.sort(
+            logits,
+            dim=-1,
+            descending=True
+        ).values
+
+        top2_top3_margin = (
+            sorted_logits[:, 1]
+            - sorted_logits[:, 2]
+        ).mean()
+    else:
+        top2_top3_margin = logits.new_tensor(0.0)
+
+    # -----------------------------------------------------
+    # 5. Top-K pair histogram
+    # N=4,K=2:
+    # 01 / 02 / 03 / 12 / 13 / 23
+    # -----------------------------------------------------
+    pair_freq = {}
+    if top_indices.shape[1] == 2:
+        pair_idx = torch.sort(
+            top_indices,
+            dim=-1
+        ).values
+        for i in range(probs.shape[-1]):
+            for j in range(i + 1, probs.shape[-1]):
+                freq = (
+                    (pair_idx[:, 0] == i)
+                    & (pair_idx[:, 1] == j)
+                ).float().mean()
+
+                pair_freq[f"pair_{i}{j}"] = freq.detach()
+
+    result = {
+        "bank": bank,
+        "route": route,
+
+        "feature_h": int(feature_hw[0]),
+        "feature_w": int(feature_hw[1]),
+
+        "prob_mean": probs.mean(dim=0).detach(),
+        "prob_std": prob_std.detach(),
+
+        "selection_rate": selection_rate.detach(),
+
+        "selected_weight_mean":
+            selected_weight_mean.detach(),
+
+        "entropy": entropy.detach(),
+
+        "top2_top3_margin":
+            top2_top3_margin.detach(),
+
+        "balance_loss":
+            balance_loss.detach(),
+    }
+
+    result.update(pair_freq)
+
+    return result
+
+
+class _FrequencyMoEBase(nn.Module):
+    """Shared DWT/enhancement/cache logic for the two experimental variants."""
+
+    band_names = ("ll", "lh", "hl", "hh")
+
+    def __init__(
+        self,
+        channels: int,
+        num_experts: int = 4,
+        top_k: int = 2,
+        expert_ratio: float = 0.25,
+        ll_gamma_init: float = 0.05,
+        hf_gate_bias_init: float = 1.0,
+        expert_gamma_init: float = 0.10,
+        router_init_std: float = 0.01,
+    ):
+        super().__init__()
+        self.channels = int(channels)
+        self.num_experts = int(num_experts)
+        self.top_k = int(top_k)
+        self.expert_ratio = float(expert_ratio)
+        self.expert_gamma_init = float(expert_gamma_init)
+        self.router_init_std = float(router_init_std)
+
+        self.dwt = HaarDWT2D()
+        self.idwt = HaarIDWT2D()
+
+        # RGB and IR enhancement paths do not share parameters.
+        self.rgb_enhance = ModalityFrequencyEnhance(
+            channels, ll_gamma_init=ll_gamma_init, hf_gate_bias_init=hf_gate_bias_init
+        )
+        self.ir_enhance = ModalityFrequencyEnhance(
+            channels, ll_gamma_init=ll_gamma_init, hf_gate_bias_init=hf_gate_bias_init
+        )
+
+        # Interface consumed by v8OBBLoss.
+        self.cache_moe_aux = False
+        self.last_moe_balance_loss = None
+        self.last_moe_debug_stats = None
+        self.moe_variant = "base"
+
+        self.last_moe_balance_terms = None
+        # 用于低频率的 expert similarity 诊断
+        self.expert_sim_interval = int(
+            os.getenv("MOE_EXPERT_SIM_INTERVAL", "1000")
+        )
+        self._moe_forward_step = 0
+
+    def _new_router(
+        self,
+        use_abs_descriptor: bool = False
+    ) -> ModalityAwareRouter:
+
+        return ModalityAwareRouter(
+            self.channels,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            init_std=self.router_init_std,
+            use_abs_descriptor=use_abs_descriptor,
+        )
+
+    def _new_bank(self) -> FusionExpertBank:
+        return FusionExpertBank(
+            self.channels,
+            num_experts=self.num_experts,
+            expert_ratio=self.expert_ratio,
+            expert_gamma_init=self.expert_gamma_init,
+        )
+
+    @staticmethod
+    def _split_inputs(x):
+        if not isinstance(x, (list, tuple)) or len(x) != 2:
+            raise ValueError("Frequency MoE fusion expects x=[rgb_feat, ir_feat]")
+        rgb, ir = x
+        if rgb.ndim != 4 or ir.ndim != 4:
+            raise ValueError("RGB/IR features must be [B,C,H,W]")
+        if rgb.shape != ir.shape:
+            raise ValueError(f"RGB/IR feature shapes must match, got {rgb.shape} vs {ir.shape}")
+        return rgb, ir
+
+    def _decompose_enhance(self, rgb: torch.Tensor, ir: torch.Tensor):
+        rgb_coeffs, rgb_hw = self.dwt(rgb)
+        ir_coeffs, ir_hw = self.dwt(ir)
+        if rgb_hw != ir_hw:
+            raise ValueError("RGB/IR spatial shapes must match before DWT")
+        rgb_coeffs = self.rgb_enhance(rgb_coeffs)
+        ir_coeffs = self.ir_enhance(ir_coeffs)
+        return rgb_coeffs, ir_coeffs, rgb_hw
+
+    def _cache(
+        self,
+        balance_loss: torch.Tensor,
+        debug_stats: List[Dict],
+        balance_terms: Dict[str, torch.Tensor] = None,
+    ):
+        if self.cache_moe_aux:
+            self.last_moe_balance_loss = balance_loss
+            self.last_moe_debug_stats = debug_stats
+            self.last_moe_balance_terms = balance_terms
+        else:
+            self.last_moe_balance_loss = None
+            self.last_moe_debug_stats = None
+            self.last_moe_balance_terms = None
+
+
+class FreqMoERouterSpecific(_FrequencyMoEBase):
+    """
+    Experiment A: Router-specific / shared-HF-expert-bank.
+
+    LL:
+        Router_LL + Bank_LL
+
+    High-frequency:
+        Router_LH --\
+        Router_HL ----> one shared Bank_HF
+        Router_HH --/
+
+    LH/HL/HH have independent routing weights; only the Fusion Master parameters
+    are shared. The HF load-balancing term is computed jointly over all three
+    high-frequency routing populations because they consume the same expert bank.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        num_experts: int = 4,
+        top_k: int = 2,
+        expert_ratio: float = 0.25,
+        ll_gamma_init: float = 0.05,
+        hf_gate_bias_init: float = 1.0,
+        expert_gamma_init: float = 0.10,
+        router_init_std: float = 0.01,
+    ):
+        super().__init__(
+            channels,
+            num_experts,
+            top_k,
+            expert_ratio,
+            ll_gamma_init,
+            hf_gate_bias_init,
+            expert_gamma_init,
+            router_init_std,
+        )
+        self.moe_variant = "router_specific"
+
+        self.ll_router = self._new_router()
+        self.ll_bank = self._new_bank()
+
+        self.lh_router = self._new_router()
+        self.hl_router = self._new_router()
+        self.hh_router = self._new_router()
+        self.hf_bank = self._new_bank()
+
+    def forward(self, x):
+        rgb, ir = self._split_inputs(x)
+        rgb_bands, ir_bands, output_hw = self._decompose_enhance(rgb, ir)
+        r_ll, r_lh, r_hl, r_hh = rgb_bands
+        i_ll, i_lh, i_hl, i_hh = ir_bands
+
+        # LL independent bank.
+        s_ll = self.ll_router(r_ll, i_ll)
+        f_ll = self.ll_bank(r_ll, i_ll, s_ll["top_indices"], s_ll["top_weights"])
+        l_ll = _balance_loss_from_routing(s_ll["probs"], s_ll["mask"], self.top_k)
+
+        # Three independent HF routers, one shared HF expert bank.
+        s_lh = self.lh_router(r_lh, i_lh)
+        s_hl = self.hl_router(r_hl, i_hl)
+        s_hh = self.hh_router(r_hh, i_hh)
+
+        f_lh = self.hf_bank(r_lh, i_lh, s_lh["top_indices"], s_lh["top_weights"])
+        f_hl = self.hf_bank(r_hl, i_hl, s_hl["top_indices"], s_hl["top_weights"])
+        f_hh = self.hf_bank(r_hh, i_hh, s_hh["top_indices"], s_hh["top_weights"])
+
+        # One balance term for the shared HF bank: aggregate LH/HL/HH routes.
+        hf_probs = torch.cat([s_lh["probs"], s_hl["probs"], s_hh["probs"]], dim=0)
+        hf_mask = torch.cat([s_lh["mask"], s_hl["mask"], s_hh["mask"]], dim=0)
+        l_hf = _balance_loss_from_routing(hf_probs, hf_mask, self.top_k)
+
+        module_balance = 0.5 * (l_ll + l_hf)
+
+        debug_stats = [
+            _routing_debug(s_ll, bank="ll", route="ll", balance_loss=l_ll, feature_hw=r_ll.shape[-2:]),
+            _routing_debug(s_lh, bank="hf", route="lh", balance_loss=l_hf, feature_hw=r_lh.shape[-2:]),
+            _routing_debug(s_hl, bank="hf", route="hl", balance_loss=l_hf, feature_hw=r_hl.shape[-2:]),
+            _routing_debug(s_hh, bank="hf", route="hh", balance_loss=l_hf, feature_hw=r_hh.shape[-2:]),
+        ]
+        self._cache(module_balance, debug_stats)
+
+        return self.idwt((f_ll, f_lh, f_hl, f_hh), output_hw=output_hw)
+
+
+class FreqMoEFullIndependent(_FrequencyMoEBase):
+    """
+    Experiment B: four fully independent MoEs.
+
+    LL/LH/HL/HH each own:
+        independent Router + independent Expert Bank
+
+    The four bank-level balance losses are averaged, so this variant does not
+    receive a larger auxiliary-loss coefficient merely because it has four banks.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        num_experts: int = 4,
+        top_k: int = 2,
+        expert_ratio: float = 0.25,
+        ll_gamma_init: float = 0.05,
+        hf_gate_bias_init: float = 1.0,
+        expert_gamma_init: float = 0.10,
+        router_init_std: float = 0.01,
+    ):
+        super().__init__(
+            channels,
+            num_experts,
+            top_k,
+            expert_ratio,
+            ll_gamma_init,
+            hf_gate_bias_init,
+            expert_gamma_init,
+            router_init_std,
+        )
+        self.moe_variant = "full_independent"
+
+        # ---------------------------------------------------------
+        # 是否使用 magnitude-aware HF Router
+        # 0:
+        #   LL: H
+        #   HF: H
+        # 1:
+        #   LL: H
+        #   HF: |H|
+        # 注意 LL 永远保持原始 descriptor，不参与这个实验变量
+        # ---------------------------------------------------------
+        self.hf_router_abs = bool(
+            int(os.getenv("MOE_HF_ROUTER_ABS", "0"))
+        )
+
+        self.routers = nn.ModuleDict({
+            "ll": self._new_router(
+                use_abs_descriptor=False
+            ),
+
+            "lh": self._new_router(
+                use_abs_descriptor=self.hf_router_abs
+            ),
+
+            "hl": self._new_router(
+                use_abs_descriptor=self.hf_router_abs
+            ),
+
+            "hh": self._new_router(
+                use_abs_descriptor=self.hf_router_abs
+            ),
+        })
+
+        self.banks = nn.ModuleDict({
+            band: self._new_bank()
+            for band in self.band_names
+        })
+
+
+    def forward(self, x):
+        rgb, ir = self._split_inputs(x)
+
+        rgb_bands, ir_bands, output_hw = \
+            self._decompose_enhance(rgb, ir)
+
+        fused_bands = []
+        balance_terms = []
+        balance_dict = {}
+        debug_stats = []
+
+        self._moe_forward_step += 1
+
+        for band, rb, ib in zip(
+            self.band_names,
+            rgb_bands,
+            ir_bands
+        ):
+            # -------------------------
+            # Router
+            # -------------------------
+            state = self.routers[band](rb, ib)
+
+            # -------------------------
+            # Top-K Expert fusion
+            # -------------------------
+            fused = self.banks[band](
+                rb,
+                ib,
+                state["top_indices"],
+                state["top_weights"]
+            )
+
+            # -------------------------
+            # 当前 band balance metric
+            # 无论 gain 是否为0都计算
+            # 方便 debug
+            # -------------------------
+            balance = _balance_loss_from_routing(
+                state["probs"],
+                state["mask"],
+                self.top_k
+            )
+
+            fused_bands.append(fused)
+            balance_terms.append(balance)
+
+            balance_dict[band] = balance
+
+            debug_item = _routing_debug(
+                state,
+                bank=band,
+                route=band,
+                balance_loss=balance,
+                feature_hw=rb.shape[-2:]
+            )
+
+            debug_stats.append(debug_item)
+
+        # 保留旧定义，仅用于兼容/debug
+        module_balance = torch.stack(
+            [v.reshape(()) for v in balance_terms]
+        ).mean()
+
+        # 关键：
+        # loss.py 后面会分别读取 LL/LH/HL/HH
+        self._cache(
+            module_balance,
+            debug_stats,
+            balance_terms=balance_dict
+        )
+
+        return self.idwt(
+            fused_bands,
+            output_hw=output_hw
+        )
+
+# =============================================================================
+# Frequency-MoE V2
+# =============================================================================
+#
+# V2 keeps ALL V1 components before Stage 2 unchanged:
+#   - Haar DWT / IDWT
+#   - RGB / IR independent Stage-1 enhancement
+#   - LL multi-scale residual refinement
+#   - LH / HL / HH magnitude-based spatial gates
+#   - Full-independent LL/LH/HL/HH routers
+#   - Top-K sparse routing
+#   - balance/debug cache interface consumed by v8OBBLoss
+#
+# The ONLY structural change is the Fusion Master:
+#
+# V1:
+#   RGB -> private residual branch --\
+#                                    + -> E_n
+#   IR  -> private residual branch --/
+#
+#   E_n = R + I + gamma_R * delta_R + gamma_I * delta_I
+#
+# V2:
+#   [RGB || IR]
+#       -> joint PW 1x1
+#       -> SiLU
+#       -> joint DW 3x3
+#       -> SiLU
+#       -> joint PW 1x1
+#       -> E_n
+#
+# No internal residual and no external/base residual are used in V2-0.
+#
+# All experts remain homogeneous in architecture and independent in parameters.
+# =============================================================================
+
+
+class JointFusionMasterV2(nn.Module):
+    """
+    V2 homogeneous joint RGB-IR Fusion Master.
+
+    The two same-frequency modality features are concatenated BEFORE any
+    learnable expert transformation, so each Master learns a true joint
+    fusion function:
+
+        E_n(R, I) = M_n([R || I])
+
+    There is deliberately NO:
+        - R + I identity term
+        - per-modality residual branch
+        - external projection residual
+
+    This is the V2-0 baseline used to isolate the effect of:
+        1) joint cross-modal expert modeling
+        2) removing the strong common V1 residual term
+
+    joint_hidden_ratio is defined relative to the single-modality channel C.
+    Default ~= 1/3 is chosen to approximately match the parameter count of
+    one V1 FusionMaster (two C -> C/4 -> C branches).
+
+    Approximate dominant point-wise parameter counts:
+
+        V1:
+            2 * [C*(C/4) + (C/4)*C]
+            ~= 1.0 * C^2
+
+        V2:
+            (2C)*H + H*C
+            = 3*C*H
+
+        Setting H ~= C/3 gives ~= 1.0 * C^2.
+
+    This avoids confounding the V1->V2 comparison with a large capacity jump.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        joint_hidden_ratio: float = 1.0 / 3.0,
+    ):
+        super().__init__()
+
+        if joint_hidden_ratio <= 0:
+            raise ValueError(
+                f"joint_hidden_ratio must be positive, got {joint_hidden_ratio}"
+            )
+
+        self.channels = int(channels)
+        self.joint_hidden_ratio = float(joint_hidden_ratio)
+
+        hidden = max(
+            int(round(self.channels * self.joint_hidden_ratio)),
+            8
+        )
+        self.hidden_channels = hidden
+
+        # [RGB || IR]: 2C -> H
+        self.reduce = nn.Conv2d(
+            self.channels * 2,
+            hidden,
+            kernel_size=1,
+            bias=True,
+        )
+
+        # Local same-frequency joint spatial transform.
+        self.dw = nn.Conv2d(
+            hidden,
+            hidden,
+            kernel_size=3,
+            padding=1,
+            groups=hidden,
+            bias=True,
+        )
+
+        # H -> C fused representation.
+        self.expand = nn.Conv2d(
+            hidden,
+            self.channels,
+            kernel_size=1,
+            bias=True,
+        )
+
+        # Keep V1 ExpertBranch activation placement unchanged
+        # so the V1->V2 ablation changes only modality organization/residual.
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(
+        self,
+        joint: torch.Tensor,
+    ) -> torch.Tensor:
+
+        if joint.ndim != 4:
+            raise ValueError(
+                f"JointFusionMasterV2 expects [B,2C,H,W], got {tuple(joint.shape)}"
+            )
+
+        expected_c = self.channels * 2
+        if joint.shape[1] != expected_c:
+            raise ValueError(
+                f"JointFusionMasterV2 expects {expected_c} input channels, "
+                f"got {joint.shape[1]}"
+            )
+
+        out = self.reduce(joint)
+        out = self.act(out)
+        out = self.dw(out)
+        out = self.act(out)
+        out = self.expand(out)
+
+        # IMPORTANT:
+        # No residual is added here.
+        return out
+
+
+class JointFusionExpertBankV2(nn.Module):
+    """
+    V2 bank of homogeneous-architecture, independently-parameterized
+    JointFusionMasterV2 experts.
+
+    The RGB/IR concatenation is performed once before expert dispatch.
+    Only sample-wise Top-K selected experts are executed.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        num_experts: int = 4,
+        joint_hidden_ratio: float = 1.0 / 3.0,
+    ):
+        super().__init__()
+
+        if num_experts < 1:
+            raise ValueError(
+                f"num_experts must be >= 1, got {num_experts}"
+            )
+
+        self.channels = int(channels)
+        self.num_experts = int(num_experts)
+        self.joint_hidden_ratio = float(joint_hidden_ratio)
+
+        self.experts = nn.ModuleList(
+            [
+                JointFusionMasterV2(
+                    channels=self.channels,
+                    joint_hidden_ratio=self.joint_hidden_ratio,
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        ir: torch.Tensor,
+        top_indices: torch.Tensor,
+        top_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        True sample-wise Top-K conditional execution.
+
+        Input:
+            rgb, ir:
+                [B,C,H,W]
+
+            top_indices:
+                [B,K]
+
+            top_weights:
+                [B,K], already normalized by post-TopK Softmax
+
+        Output:
+            fused:
+                [B,C,H,W]
+        """
+
+        if rgb.shape != ir.shape:
+            raise ValueError(
+                f"JointFusionExpertBankV2 expects matching RGB/IR shapes, "
+                f"got {tuple(rgb.shape)} vs {tuple(ir.shape)}"
+            )
+
+        if top_indices.ndim != 2 or top_indices.shape[0] != rgb.shape[0]:
+            raise ValueError(
+                f"top_indices must be [B,K], got {tuple(top_indices.shape)} "
+                f"for B={rgb.shape[0]}"
+            )
+
+        if top_weights.shape != top_indices.shape:
+            raise ValueError(
+                f"top_weights shape must equal top_indices shape, got "
+                f"{tuple(top_weights.shape)} vs {tuple(top_indices.shape)}"
+            )
+
+        # The core V2 change:
+        # concatenate the two same-frequency modality features BEFORE
+        # any learnable expert transformation.
+        joint = torch.cat([rgb, ir], dim=1)
+
+        # Every Master outputs C channels, so the MoE output shape is
+        # identical to one modality feature and remains IDWT-compatible.
+        out = torch.zeros_like(rgb)
+
+        for expert_id, expert in enumerate(self.experts):
+            selected = top_indices.eq(expert_id)
+            sample_idx, slot_idx = torch.where(selected)
+
+            if sample_idx.numel() == 0:
+                continue
+
+            joint_sub = joint.index_select(
+                0,
+                sample_idx
+            )
+
+            expert_out = expert(
+                joint_sub
+            )
+
+            w = top_weights[
+                sample_idx,
+                slot_idx
+            ].to(
+                device=expert_out.device,
+                dtype=expert_out.dtype,
+            )
+
+            weighted = (
+                expert_out
+                * w.view(-1, 1, 1, 1)
+            )
+
+            out = out.index_add(
+                0,
+                sample_idx,
+                weighted
+            )
+
+        return out
+
+
+class FreqMoEFullIndependentV2(_FrequencyMoEBase):
+    """
+    Frequency-MoE V2-0: Full-independent Joint Fusion Masters.
+
+    Pipeline:
+        RGB / IR feature
+            -> fixed Haar DWT
+            -> V1 Stage-1 modality-specific frequency enhancement
+            -> for each of LL/LH/HL/HH independently:
+                   V1 Router
+                   + V2 JointFusionExpertBank
+                   + Top-K weighted sum
+            -> fixed Haar IDWT
+            -> one fused spatial feature
+
+    Full-independent organization is kept from the best V1 configuration:
+        LL: Router_LL + Bank_LL
+        LH: Router_LH + Bank_LH
+        HL: Router_HL + Bank_HL
+        HH: Router_HH + Bank_HH
+
+    V2-0 intentionally keeps:
+        - same Router implementation as V1
+        - same optional MOE_HF_ROUTER_ABS switch
+        - same balance/debug cache interface
+        - same Top-K routing
+
+    V2-0 intentionally removes:
+        - V1 dual modality-specific ExpertBranches
+        - V1 Expert internal residual
+        - common R + I term
+        - any external/base fusion residual
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        num_experts: int = 4,
+        top_k: int = 2,
+        joint_hidden_ratio: float = 1.0 / 3.0,
+        ll_gamma_init: float = 0.05,
+        hf_gate_bias_init: float = 1.0,
+        router_init_std: float = 0.01,
+    ):
+        # _FrequencyMoEBase owns the V1 DWT / Stage1 / cache logic.
+        #
+        # Its old expert_ratio / expert_gamma_init fields are irrelevant
+        # for V2 banks, but harmless. Fixed values are passed only to reuse
+        # the tested base implementation without modifying V1 code.
+        super().__init__(
+            channels=channels,
+            num_experts=num_experts,
+            top_k=top_k,
+            expert_ratio=0.25,
+            ll_gamma_init=ll_gamma_init,
+            hf_gate_bias_init=hf_gate_bias_init,
+            expert_gamma_init=0.10,
+            router_init_std=router_init_std,
+        )
+
+        self.joint_hidden_ratio = float(
+            joint_hidden_ratio
+        )
+
+        self.moe_variant = (
+            "full_independent_v2_joint"
+        )
+
+        # Keep the V1 Router experimental switch unchanged.
+        #
+        # Default 0:
+        #   LL descriptor: signed
+        #   HF descriptor: signed
+        #
+        # Optional 1:
+        #   LL descriptor: signed
+        #   HF descriptor: magnitude
+        #
+        # IMPORTANT:
+        # Stage-1 HighFrequencyGate already uses |H| in V1 and remains
+        # unchanged. This environment variable affects only Stage-2 Router.
+        self.hf_router_abs = bool(
+            int(
+                os.getenv(
+                    "MOE_HF_ROUTER_ABS",
+                    "0"
+                )
+            )
+        )
+
+        # Four independent V1 routers.
+        self.routers = nn.ModuleDict(
+            {
+                "ll": self._new_router(
+                    use_abs_descriptor=False
+                ),
+                "lh": self._new_router(
+                    use_abs_descriptor=self.hf_router_abs
+                ),
+                "hl": self._new_router(
+                    use_abs_descriptor=self.hf_router_abs
+                ),
+                "hh": self._new_router(
+                    use_abs_descriptor=self.hf_router_abs
+                ),
+            }
+        )
+
+        # Four fully independent V2 joint expert banks.
+        self.banks = nn.ModuleDict(
+            {
+                band: JointFusionExpertBankV2(
+                    channels=self.channels,
+                    num_experts=self.num_experts,
+                    joint_hidden_ratio=self.joint_hidden_ratio,
+                )
+                for band in self.band_names
+            }
+        )
+
+    def forward(self, x):
+        rgb, ir = self._split_inputs(x)
+
+        # EXACTLY reuse V1 Stage-1.
+        rgb_bands, ir_bands, output_hw = \
+            self._decompose_enhance(
+                rgb,
+                ir
+            )
+
+        fused_bands = []
+        balance_terms = []
+        balance_dict = {}
+        debug_stats = []
+
+        self._moe_forward_step += 1
+
+        for band, rb, ib in zip(
+            self.band_names,
+            rgb_bands,
+            ir_bands,
+        ):
+            # -------------------------------------------------
+            # Router:
+            # Keep V1 implementation and inputs unchanged.
+            #
+            # Conceptually equivalent to pooling [RGB || IR],
+            # because pooling is channel-wise before the FC.
+            # -------------------------------------------------
+            state = self.routers[band](
+                rb,
+                ib
+            )
+
+            # -------------------------------------------------
+            # V2 Joint Top-K Master fusion.
+            #
+            # The Bank concatenates RGB/IR before the first
+            # learnable expert transform.
+            # -------------------------------------------------
+            fused = self.banks[band](
+                rb,
+                ib,
+                state["top_indices"],
+                state["top_weights"],
+            )
+
+            # -------------------------------------------------
+            # Balance metric:
+            # Keep exactly the V1 definition so loss.py can use
+            # LL and HF gains independently.
+            # -------------------------------------------------
+            balance = _balance_loss_from_routing(
+                state["probs"],
+                state["mask"],
+                self.top_k,
+            )
+
+            fused_bands.append(
+                fused
+            )
+            balance_terms.append(
+                balance
+            )
+            balance_dict[band] = (
+                balance
+            )
+
+            debug_item = _routing_debug(
+                state,
+                bank=band,
+                route=band,
+                balance_loss=balance,
+                feature_hw=rb.shape[-2:],
+            )
+
+            debug_stats.append(
+                debug_item
+            )
+
+        # Kept only for legacy/debug compatibility.
+        module_balance = torch.stack(
+            [
+                value.reshape(())
+                for value in balance_terms
+            ]
+        ).mean()
+
+        # Same cache contract as V1:
+        # loss.py needs no V2-specific branch.
+        self._cache(
+            module_balance,
+            debug_stats,
+            balance_terms=balance_dict,
+        )
+
+        # No external residual.
+        # The four MoEs have already generated complete fused subbands.
+        return self.idwt(
+            fused_bands,
+            output_hw=output_hw,
+        )
+
+class FreqMoEFullIndependentV2Residual(_FrequencyMoEBase):
+    """
+    V2-R: Full-independent Joint Fusion MoE with an external joint residual.
+
+    For each frequency band b:
+
+        X_b = Concat(RGB_b, IR_b)                       # [B, 2C, H, W]
+        F_base_b = P_b(X_b)                             # 1x1 Conv: 2C -> C
+        F_moe_b  = sum_{n in TopK} w_n M_n(X_b)        # Joint V2 Masters
+        F_b      = F_base_b + gamma_b * F_moe_b
+
+    Important:
+        1. The residual base comes from Concat(RGB, IR), NOT RGB + IR.
+        2. P_b is independent for LL/LH/HL/HH.
+        3. gamma_b is a learnable scalar, also independent per band.
+        4. No residual exists inside JointFusionMasterV2.
+        5. Router / Top-K / balance / debug remain identical to V2-0.
+        6. Stage1 remains exactly the V1/V2-0 implementation.
+
+    Default residual_gamma_init = 0.5:
+        larger than V1's 0.1 expert-internal correction, because here the MoE
+        branch is intended to make a meaningful contribution rather than act
+        as a tiny perturbation around a dominant base path.
+
+    YAML args:
+        [num_experts, top_k, joint_hidden_ratio, residual_gamma_init]
+
+    parse_model() still prepends channels automatically:
+        args = [c, *args]
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        num_experts: int = 4,
+        top_k: int = 2,
+        joint_hidden_ratio: float = 1.0 / 3.0,
+        residual_gamma_init: float = 0.5,
+        ll_gamma_init: float = 0.05,
+        hf_gate_bias_init: float = 1.0,
+        router_init_std: float = 0.01,
+    ):
+        super().__init__(
+            channels=channels,
+            num_experts=num_experts,
+            top_k=top_k,
+            expert_ratio=0.25,          # unused by V2 Joint Banks
+            ll_gamma_init=ll_gamma_init,
+            hf_gate_bias_init=hf_gate_bias_init,
+            expert_gamma_init=0.10,    # unused by V2 Joint Banks
+            router_init_std=router_init_std,
+        )
+
+        if residual_gamma_init < 0:
+            raise ValueError(
+                f"residual_gamma_init must be >= 0, got {residual_gamma_init}"
+            )
+
+        self.joint_hidden_ratio = float(joint_hidden_ratio)
+        self.residual_gamma_init = float(residual_gamma_init)
+
+        self.moe_variant = "full_independent_v2_joint_residual"
+
+        # Keep V2-0 / V1 router switch unchanged.
+        self.hf_router_abs = bool(
+            int(os.getenv("MOE_HF_ROUTER_ABS", "0"))
+        )
+
+        # ---------------------------------------------------------
+        # Four independent routers: unchanged from V2-0.
+        # ---------------------------------------------------------
+        self.routers = nn.ModuleDict(
+            {
+                "ll": self._new_router(use_abs_descriptor=False),
+                "lh": self._new_router(use_abs_descriptor=self.hf_router_abs),
+                "hl": self._new_router(use_abs_descriptor=self.hf_router_abs),
+                "hh": self._new_router(use_abs_descriptor=self.hf_router_abs),
+            }
+        )
+
+        # ---------------------------------------------------------
+        # Four independent V2 Joint Expert Banks.
+        # ---------------------------------------------------------
+        self.banks = nn.ModuleDict(
+            {
+                band: JointFusionExpertBankV2(
+                    channels=self.channels,
+                    num_experts=self.num_experts,
+                    joint_hidden_ratio=self.joint_hidden_ratio,
+                )
+                for band in self.band_names
+            }
+        )
+
+        # ---------------------------------------------------------
+        # External joint residual base:
+        #
+        #   [RGB_b || IR_b] : 2C
+        #            ↓
+        #        Conv 1x1
+        #            ↓
+        #             C
+        #
+        # Each frequency band owns an independent projection.
+        # No activation is used: this path is kept as a simple learnable
+        # linear joint-fusion shortcut.
+        # ---------------------------------------------------------
+        self.base_proj = nn.ModuleDict(
+            {
+                band: nn.Conv2d(
+                    2 * self.channels,
+                    self.channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=True,
+                )
+                for band in self.band_names
+            }
+        )
+
+        # ---------------------------------------------------------
+        # Learnable external MoE scale.
+        #
+        # One scalar per band rather than one global scalar because the
+        # useful MoE correction strength can differ between LL and the
+        # three directional high-frequency bands.
+        #
+        # Unconstrained parameter:
+        #   gamma can adapt freely during training.
+        # Initial value is exposed in YAML.
+        # ---------------------------------------------------------
+        self.residual_gamma = nn.ParameterDict(
+            {
+                band: nn.Parameter(
+                    torch.tensor(
+                        self.residual_gamma_init,
+                        dtype=torch.float32,
+                    )
+                )
+                for band in self.band_names
+            }
+        )
+
+    def forward(self, x):
+        rgb, ir = self._split_inputs(x)
+
+        # Exactly reuse V1/V2-0 DWT + Stage1 enhancement.
+        rgb_bands, ir_bands, output_hw = self._decompose_enhance(
+            rgb,
+            ir,
+        )
+
+        fused_bands = []
+        balance_terms = []
+        balance_dict = {}
+        debug_stats = []
+
+        self._moe_forward_step += 1
+
+        for band, rb, ib in zip(
+            self.band_names,
+            rgb_bands,
+            ir_bands,
+        ):
+            # -----------------------------------------------------
+            # Router: unchanged.
+            # -----------------------------------------------------
+            state = self.routers[band](
+                rb,
+                ib,
+            )
+
+            # -----------------------------------------------------
+            # V2 Joint MoE branch.
+            # JointFusionExpertBankV2 internally concatenates
+            # [rb || ib] before the first learnable expert layer.
+            # -----------------------------------------------------
+            moe_out = self.banks[band](
+                rb,
+                ib,
+                state["top_indices"],
+                state["top_weights"],
+            )
+
+            # -----------------------------------------------------
+            # External joint residual base.
+            # IMPORTANT: concat-derived projection, not rb + ib.
+            # -----------------------------------------------------
+            joint = torch.cat(
+                [rb, ib],
+                dim=1,
+            )
+
+            base = self.base_proj[band](
+                joint
+            )
+
+            gamma = self.residual_gamma[band].to(
+                device=moe_out.device,
+                dtype=moe_out.dtype,
+            )
+
+            # V2-R:
+            # complete projection base + learnable-scaled Joint-MoE branch.
+            fused = base + gamma * moe_out
+
+            # -----------------------------------------------------
+            # Same balance definition as V1 / V2-0.
+            # -----------------------------------------------------
+            balance = _balance_loss_from_routing(
+                state["probs"],
+                state["mask"],
+                self.top_k,
+            )
+
+            fused_bands.append(
+                fused
+            )
+            balance_terms.append(
+                balance
+            )
+            balance_dict[band] = (
+                balance
+            )
+
+            debug_item = _routing_debug(
+                state,
+                bank=band,
+                route=band,
+                balance_loss=balance,
+                feature_hw=rb.shape[-2:],
+            )
+
+            debug_stats.append(
+                debug_item
+            )
+
+        module_balance = torch.stack(
+            [
+                value.reshape(())
+                for value in balance_terms
+            ]
+        ).mean()
+
+        # Same cache contract as V1/V2-0:
+        # current loss.py needs no modification.
+        self._cache(
+            module_balance,
+            debug_stats,
+            balance_terms=balance_dict,
+        )
+
+        return self.idwt(
+            fused_bands,
+            output_hw=output_hw,
+        )
+
+
+
+# =============================================================================
+# Fixed Haar DWT / IDWT
+# =============================================================================
+
+class HaarDWT2D(nn.Module):
+    """Fixed orthonormal 2-D Haar DWT by 2x2 slicing."""
+
+    def forward(self, x: torch.Tensor):
+        if x.ndim != 4:
+            raise ValueError(f"HaarDWT2D expects [B,C,H,W], got {tuple(x.shape)}")
+
+        h0, w0 = x.shape[-2:]
+        pad_h = h0 & 1
+        pad_w = w0 & 1
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+
+        a = x[..., 0::2, 0::2]
+        b = x[..., 0::2, 1::2]
+        c = x[..., 1::2, 0::2]
+        d = x[..., 1::2, 1::2]
+
+        ll = (a + b + c + d) * 0.5
+        lh = (-a - b + c + d) * 0.5
+        hl = (-a + b - c + d) * 0.5
+        hh = (a - b - c + d) * 0.5
+
+        return (ll, lh, hl, hh), (h0, w0)
+
+
+class HaarIDWT2D(nn.Module):
+    """Exact inverse of HaarDWT2D."""
+
+    def forward(
+        self,
+        coeffs: Sequence[torch.Tensor],
+        output_hw: Tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        if len(coeffs) != 4:
+            raise ValueError(f"HaarIDWT2D expects 4 bands, got {len(coeffs)}")
+
+        ll, lh, hl, hh = coeffs
+        if not (ll.shape == lh.shape == hl.shape == hh.shape):
+            raise ValueError("LL/LH/HL/HH must have identical shapes")
+
+        a = (ll - lh - hl + hh) * 0.5
+        b = (ll - lh + hl - hh) * 0.5
+        c = (ll + lh - hl - hh) * 0.5
+        d = (ll + lh + hl + hh) * 0.5
+
+        B, C, H, W = ll.shape
+        out = ll.new_empty(B, C, H * 2, W * 2)
+        out[..., 0::2, 0::2] = a
+        out[..., 0::2, 1::2] = b
+        out[..., 1::2, 0::2] = c
+        out[..., 1::2, 1::2] = d
+
+        if output_hw is not None:
+            h0, w0 = output_hw
+            out = out[..., :h0, :w0]
+        return out
+
+
+# =============================================================================
+# LL local multi-scale enhancement
+# =============================================================================
+
+class MultiScaleLowFreqEnhance(nn.Module):
+    """
+    Modality-specific LL enhancement.
+
+        x
+        |-- DWConv 3x3 --|
+        |-- DWConv 5x5 --| -> concat -> PWConv 1x1 -> residual add
+        |-- DWConv 7x7 --|
+
+    No BN. No cross-modal interaction occurs here.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.dw3 = nn.Conv2d(
+            channels, channels, 3, 1, 1, groups=channels, bias=True
+        )
+        self.dw5 = nn.Conv2d(
+            channels, channels, 5, 1, 2, groups=channels, bias=True
+        )
+        self.dw7 = nn.Conv2d(
+            channels, channels, 7, 1, 3, groups=channels, bias=True
+        )
+        self.pw = nn.Conv2d(channels * 3, channels, 1, 1, 0, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        delta = self.pw(torch.cat([self.dw3(x), self.dw5(x), self.dw7(x)], dim=1))
+        return x + delta
+
+
+# =============================================================================
+# Coupled SSM core: paper Eq.(6)
+# =============================================================================
+
+class _ModalitySSMParams(nn.Module):
+    """
+    Generate modality-specific B_t, C_t and Delta_t from the current sequence.
+
+    Input : [B,L,E]
+    B,C   : [B,L,N]
+    Delta : [B,L,E]
+
+    A is input-independent and modality-specific:
+        A = -exp(A_log)
+    with A_log initialized to zero. The paper does not specify A initialization;
+    the negative exponential follows the stable continuous-time Mamba convention.
+    """
+
+    def __init__(
+        self,
+        d_inner: int,
+        d_state: int,
+        dt_min: float = 1e-3,
+        dt_max: float = 1e-1,
+        dt_init_floor: float = 1e-4,
+    ):
+        super().__init__()
+        self.d_inner = d_inner
+        self.d_state = d_state
+
+        self.B_proj = nn.Linear(d_inner, d_state, bias=False)
+        self.C_proj = nn.Linear(d_inner, d_state, bias=False)
+        self.delta_proj = nn.Linear(d_inner, d_inner, bias=False)
+
+        # Input-independent Delta bias, as in Algorithm 1.
+        dt = torch.exp(
+            torch.rand(d_inner) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.delta_bias = nn.Parameter(inv_dt)
+
+        # Stable negative continuous A. Zero log-init => A starts at -1.
+        self.A_log = nn.Parameter(torch.zeros(d_inner, d_state))
+        self.A_log._no_weight_decay = True
+
+    def forward(self, u: torch.Tensor):
+        B_t = self.B_proj(u)
+        C_t = self.C_proj(u)
+        delta = F.softplus(self.delta_proj(u) + self.delta_bias)
+        A = -torch.exp(self.A_log.float()).to(dtype=u.dtype, device=u.device)
+        return A, B_t, C_t, delta
+
+
+class _AffineCoupledScanFn(torch.autograd.Function):
+    """
+    Exact parallel implementation of the two-modal Eq.(6) recurrence.
+
+    This is NOT the ordinary Mamba selective_scan_cuda kernel.
+    It exploits the algebraic reduction:
+
+        s_t = h_R,t + h_I,t
+            = P_t * s_{t-1} + U_t
+
+        P_t = S_R,t + S_I,t
+        U_t = Bbar_R,t * x_R,t + Bbar_I,t * x_I,t
+
+    and evaluates the affine recurrence with an associative prefix scan
+    in O(log L) tensor stages instead of an O(L) Python loop.
+
+    A custom backward is supplied so autograd does not retain every
+    prefix-scan stage. Backward is also reduced to a reverse affine scan.
+
+    Inputs
+    ------
+    x_rgb/x_ir : [B,L,E]
+    S_*        : [B,L,E,N]
+    Bbar_*     : [B,L,E,N]
+    C_*        : [B,L,N]
+
+    Outputs
+    -------
+    y_rgb/y_ir : [B,L,E]
+    """
+
+    @staticmethod
+    def _affine_prefix(P: torch.Tensor, U: torch.Tensor):
+        """
+        Inclusive prefix of affine maps T_t(s)=P_t*s+U_t.
+
+        Composition:
+            (P_b,U_b) o (P_a,U_a)
+              = (P_b*P_a, U_b + P_b*U_a)
+
+        The operator is associative, so Hillis-Steele style doubling is exact
+        up to floating-point reassociation.
+        """
+        if P.shape != U.shape:
+            raise ValueError("P and U must have identical shapes")
+
+        L = P.shape[1]
+        pref_P = P
+        pref_U = U
+        offset = 1
+
+        while offset < L:
+            # Use values from the PREVIOUS stage on both sides.
+            tail_P = pref_P[:, offset:]
+            left_P = pref_P[:, :-offset]
+            tail_U = pref_U[:, offset:]
+            left_U = pref_U[:, :-offset]
+
+            new_tail_P = tail_P * left_P
+            new_tail_U = tail_U + tail_P * left_U
+
+            pref_P = torch.cat((pref_P[:, :offset], new_tail_P), dim=1)
+            pref_U = torch.cat((pref_U[:, :offset], new_tail_U), dim=1)
+            offset <<= 1
+
+        return pref_P, pref_U
+
+    @staticmethod
+    def forward(
+        ctx,
+        x_rgb,
+        x_ir,
+        S_rgb,
+        S_ir,
+        Bbar_rgb,
+        Bbar_ir,
+        C_rgb,
+        C_ir,
+    ):
+        # Forward of custom autograd.Function runs without graph construction.
+        P = S_rgb + S_ir
+        U_rgb = Bbar_rgb * x_rgb.unsqueeze(-1)
+        U_ir = Bbar_ir * x_ir.unsqueeze(-1)
+        U = U_rgb + U_ir
+
+        _, shared_all = _AffineCoupledScanFn._affine_prefix(P, U)
+
+        # Eq.(6) needs the PREVIOUS shared state at each position.
+        zero = torch.zeros_like(shared_all[:, :1])
+        shared_prev = torch.cat((zero, shared_all[:, :-1]), dim=1)
+
+        h_rgb = S_rgb * shared_prev + U_rgb
+        h_ir = S_ir * shared_prev + U_ir
+
+        y_rgb = torch.einsum("blen,bln->ble", h_rgb, C_rgb)
+        y_ir = torch.einsum("blen,bln->ble", h_ir, C_ir)
+
+        # One shared-state tensor is enough to reconstruct h in backward.
+        ctx.save_for_backward(
+            x_rgb,
+            x_ir,
+            S_rgb,
+            S_ir,
+            Bbar_rgb,
+            Bbar_ir,
+            C_rgb,
+            C_ir,
+            shared_prev,
+        )
+        return y_rgb, y_ir
+
+    @staticmethod
+    def backward(ctx, grad_y_rgb, grad_y_ir):
+        (
+            x_rgb,
+            x_ir,
+            S_rgb,
+            S_ir,
+            Bbar_rgb,
+            Bbar_ir,
+            C_rgb,
+            C_ir,
+            shared_prev,
+        ) = ctx.saved_tensors
+
+        # ============================================================
+        # AMP-safe backward:
+        # custom Function backward 不依赖 autocast，
+        # 因此内部统一使用 FP32，避免 Float/Half 混合。
+        # ============================================================
+        gy_rgb = grad_y_rgb.float()
+        gy_ir = grad_y_ir.float()
+
+        xr = x_rgb.float()
+        xi = x_ir.float()
+
+        Sr = S_rgb.float()
+        Si = S_ir.float()
+
+        Br = Bbar_rgb.float()
+        Bi = Bbar_ir.float()
+
+        Cr = C_rgb.float()
+        Ci = C_ir.float()
+
+        shared = shared_prev.float()
+
+        # ------------------------------------------------------------
+        # reconstruct current states
+        # ------------------------------------------------------------
+        U_rgb = Br * xr.unsqueeze(-1)
+        U_ir = Bi * xi.unsqueeze(-1)
+
+        h_rgb = Sr * shared + U_rgb
+        h_ir = Si * shared + U_ir
+
+        # ------------------------------------------------------------
+        # direct gradient from:
+        # y_t = C_t h_t
+        # ------------------------------------------------------------
+        direct_rgb = gy_rgb.unsqueeze(-1) * Cr.unsqueeze(2)
+        direct_ir = gy_ir.unsqueeze(-1) * Ci.unsqueeze(2)
+
+        # ------------------------------------------------------------
+        # reverse coupled recurrence
+        #
+        # lambda_{t-1}
+        # = (S_R,t + S_I,t) * lambda_t
+        #   + direct_R,t * S_R,t
+        #   + direct_I,t * S_I,t
+        # ------------------------------------------------------------
+        P = Sr + Si
+        Q = direct_rgb * Sr + direct_ir * Si
+
+        B, L, E, N = P.shape
+
+        lambda_all = torch.zeros_like(P)
+
+        if L > 1:
+            P_rev = torch.flip(P[:, 1:], dims=[1])
+            Q_rev = torch.flip(Q[:, 1:], dims=[1])
+
+            _, lambda_rev = _AffineCoupledScanFn._affine_prefix(
+                P_rev,
+                Q_rev,
+            )
+
+            lambda_all = torch.cat(
+                (
+                    torch.flip(lambda_rev, dims=[1]),
+                    torch.zeros_like(P[:, :1]),
+                ),
+                dim=1,
+            )
+
+        grad_h_rgb = direct_rgb + lambda_all
+        grad_h_ir = direct_ir + lambda_all
+
+        # ------------------------------------------------------------
+        # gradients of
+        # h_m = S_m * shared_prev + Bbar_m * x_m
+        # ------------------------------------------------------------
+        grad_S_rgb = grad_h_rgb * shared
+        grad_S_ir = grad_h_ir * shared
+
+        grad_Bbar_rgb = grad_h_rgb * xr.unsqueeze(-1)
+        grad_Bbar_ir = grad_h_ir * xi.unsqueeze(-1)
+
+        grad_x_rgb = torch.sum(
+            grad_h_rgb * Br,
+            dim=-1,
+        )
+
+        grad_x_ir = torch.sum(
+            grad_h_ir * Bi,
+            dim=-1,
+        )
+
+        # ------------------------------------------------------------
+        # gradients of C
+        # y_m = sum_n C_m[n] * h_m[n]
+        # ------------------------------------------------------------
+        grad_C_rgb = torch.einsum(
+            "ble,blen->bln",
+            gy_rgb,
+            h_rgb,
+        )
+
+        grad_C_ir = torch.einsum(
+            "ble,blen->bln",
+            gy_ir,
+            h_ir,
+        )
+
+        # ============================================================
+        # IMPORTANT:
+        # return gradients in the dtype of their corresponding inputs.
+        # ============================================================
+        return (
+            grad_x_rgb.to(x_rgb.dtype),
+            grad_x_ir.to(x_ir.dtype),
+
+            grad_S_rgb.to(S_rgb.dtype),
+            grad_S_ir.to(S_ir.dtype),
+
+            grad_Bbar_rgb.to(Bbar_rgb.dtype),
+            grad_Bbar_ir.to(Bbar_ir.dtype),
+
+            grad_C_rgb.to(C_rgb.dtype),
+            grad_C_ir.to(C_ir.dtype),
+        )
+
+
+class CoupledSelectiveScan1D(nn.Module):
+    """
+    Accelerated exact implementation of paper Eq.(6) for two modalities.
+
+    Mathematical model is unchanged from the reference implementation.
+    Only the execution algorithm is changed:
+
+        reference: O(L) Python recurrent loop
+        fast     : O(log L) associative affine prefix scan
+
+    transition_mode:
+      - "algorithm1" (V1 default): follows Algorithm 1 lines 13-14
+      - "zoh": follows paper Eq.(2), diagonal-A specialization
+    """
+
+    def __init__(
+        self,
+        d_inner: int,
+        d_state: int = 16,
+        transition_mode: str = "algorithm1",
+        dt_min: float = 1e-3,
+        dt_max: float = 1e-1,
+    ):
+        super().__init__()
+        if transition_mode not in {"algorithm1", "zoh"}:
+            raise ValueError(
+                f"transition_mode must be 'algorithm1' or 'zoh', got {transition_mode}"
+            )
+
+        self.d_inner = d_inner
+        self.d_state = d_state
+        self.transition_mode = transition_mode
+
+        self.rgb_params = _ModalitySSMParams(
+            d_inner, d_state, dt_min=dt_min, dt_max=dt_max
+        )
+        self.ir_params = _ModalitySSMParams(
+            d_inner, d_state, dt_min=dt_min, dt_max=dt_max
+        )
+
+    @staticmethod
+    def _transition_algorithm1(
+        A: torch.Tensor,
+        B_t: torch.Tensor,
+        delta_t: torch.Tensor,
+    ):
+        # Vectorized over the whole sequence:
+        # A       : [E,N]
+        # B_t     : [B,L,N]
+        # delta_t : [B,L,E]
+        S = delta_t.unsqueeze(-1) * A.view(1, 1, *A.shape)
+        Bbar = delta_t.unsqueeze(-1) * B_t.unsqueeze(2)
+        return S, Bbar
+
+    @staticmethod
+    def _transition_zoh(
+        A: torch.Tensor,
+        B_t: torch.Tensor,
+        delta_t: torch.Tensor,
+    ):
+        delta_A = delta_t.unsqueeze(-1) * A.view(1, 1, *A.shape)
+        S = torch.exp(delta_A)
+
+        gain = torch.expm1(delta_A) / A.view(1, 1, *A.shape)
+        Bbar = gain * B_t.unsqueeze(2)
+        return S, Bbar
+
+    def _transition(self, A, B_t, delta_t):
+        if self.transition_mode == "algorithm1":
+            return self._transition_algorithm1(A, B_t, delta_t)
+        return self._transition_zoh(A, B_t, delta_t)
+
+    def forward(
+        self,
+        x_rgb: torch.Tensor,
+        x_ir: torch.Tensor,
+        h0_rgb: torch.Tensor | None = None,
+        h0_ir: torch.Tensor | None = None,
+        return_states: bool = False,
+    ):
+        if return_states:
+            raise NotImplementedError(
+                "Fast training path does not materialize all hidden states. "
+                "Use the slow reference implementation only for debugging states."
+            )
+        if h0_rgb is not None or h0_ir is not None:
+            raise NotImplementedError(
+                "V1 visual training always uses zero initial states; "
+                "non-zero h0 is not implemented in the fast path."
+            )
+        if x_rgb.ndim != 3 or x_ir.ndim != 3:
+            raise ValueError(
+                f"CoupledSelectiveScan1D expects [B,L,E], got "
+                f"{tuple(x_rgb.shape)} and {tuple(x_ir.shape)}"
+            )
+        if x_rgb.shape != x_ir.shape:
+            raise ValueError("RGB and IR sequences must have the same shape")
+        if x_rgb.shape[-1] != self.d_inner:
+            raise ValueError(
+                f"Expected inner dim {self.d_inner}, got {x_rgb.shape[-1]}"
+            )
+
+        A_rgb, B_rgb, C_rgb, dt_rgb = self.rgb_params(x_rgb)
+        A_ir, B_ir, C_ir, dt_ir = self.ir_params(x_ir)
+
+        S_rgb, Bbar_rgb = self._transition(A_rgb, B_rgb, dt_rgb)
+        S_ir, Bbar_ir = self._transition(A_ir, B_ir, dt_ir)
+
+        return _AffineCoupledScanFn.apply(
+            x_rgb,
+            x_ir,
+            S_rgb,
+            S_ir,
+            Bbar_rgb,
+            Bbar_ir,
+            C_rgb,
+            C_ir,
+        )
+
+# =============================================================================
+# Full-map four-direction Cross Scan / Merge
+# =============================================================================
+
+class CrossScan2D:
+    """
+    Convert [B,E,H,W] into four full-map sequences [B,L,E], L=H*W.
+
+    0: row-major forward
+    1: row-major backward
+    2: column-major forward
+    3: column-major backward
+    """
+
+    @staticmethod
+    def apply(x: torch.Tensor) -> List[torch.Tensor]:
+        if x.ndim != 4:
+            raise ValueError(f"CrossScan2D expects [B,E,H,W], got {tuple(x.shape)}")
+
+        row = x.flatten(2).transpose(1, 2).contiguous()
+        row_rev = torch.flip(row, dims=[1])
+
+        col = (
+            x.transpose(2, 3)
+            .contiguous()
+            .flatten(2)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        col_rev = torch.flip(col, dims=[1])
+
+        return [row, row_rev, col, col_rev]
+
+
+class CrossMerge2D:
+    """Inverse geometry of CrossScan2D, then sum the four directional outputs."""
+
+    @staticmethod
+    def apply(
+        ys: Sequence[torch.Tensor],
+        H: int,
+        W: int,
+        reduce: str = "sum",
+    ) -> torch.Tensor:
+        if len(ys) != 4:
+            raise ValueError("CrossMerge2D expects exactly four directional sequences")
+        if reduce not in {"sum", "mean"}:
+            raise ValueError("reduce must be 'sum' or 'mean'")
+
+        y0, y1, y2, y3 = ys
+        B, L, E = y0.shape
+        if L != H * W:
+            raise ValueError(f"Sequence length {L} != H*W={H*W}")
+
+        row_f = y0.view(B, H, W, E)
+        row_b = torch.flip(y1, dims=[1]).view(B, H, W, E)
+
+        col_f = (
+            y2.view(B, W, H, E)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        col_b = (
+            torch.flip(y3, dims=[1])
+            .view(B, W, H, E)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+
+        out = row_f + row_b + col_f + col_b
+        if reduce == "mean":
+            out = out * 0.25
+        return out
+
+
+class CoupledSS2D(nn.Module):
+    """
+    Four-direction visual extension of CoupledSelectiveScan1D.
+
+    Each scan direction has its own modality-specific A/B/C/Delta parameters,
+    analogous to direction-specific SS2D projections.
+    """
+
+    def __init__(
+        self,
+        d_inner: int,
+        d_state: int = 16,
+        transition_mode: str = "algorithm1",
+    ):
+        super().__init__()
+        self.d_inner = d_inner
+        self.scans = nn.ModuleList(
+            [
+                CoupledSelectiveScan1D(
+                    d_inner=d_inner,
+                    d_state=d_state,
+                    transition_mode=transition_mode,
+                )
+                for _ in range(4)
+            ]
+        )
+
+    def forward(self, x_rgb: torch.Tensor, x_ir: torch.Tensor):
+        if x_rgb.shape != x_ir.shape:
+            raise ValueError("RGB and IR 2D features must have identical shapes")
+        if x_rgb.ndim != 4:
+            raise ValueError("CoupledSS2D expects NCHW inputs")
+        if x_rgb.shape[1] != self.d_inner:
+            raise ValueError(
+                f"Expected {self.d_inner} channels, got {x_rgb.shape[1]}"
+            )
+
+        _, _, H, W = x_rgb.shape
+        seq_rgb = CrossScan2D.apply(x_rgb)
+        seq_ir = CrossScan2D.apply(x_ir)
+
+        y_rgb_dirs = []
+        y_ir_dirs = []
+
+        for k in range(4):
+            yr, yi = self.scans[k](seq_rgb[k], seq_ir[k])
+            y_rgb_dirs.append(yr)
+            y_ir_dirs.append(yi)
+
+        # Standard cross-merge uses directional summation. A subsequent
+        # LayerNorm in the VSS outer block controls scale.
+        y_rgb = CrossMerge2D.apply(y_rgb_dirs, H, W, reduce="sum")
+        y_ir = CrossMerge2D.apply(y_ir_dirs, H, W, reduce="sum")
+
+        # Return BHWC, matching LayerNorm/Linear convention.
+        return y_rgb, y_ir
+
+
+# =============================================================================
+# Dual VSS outer block
+# =============================================================================
+
+class CoupledVSSBlock2D(nn.Module):
+    """
+    Two modality-specific VSS shells sharing one Coupled SS2D interaction core.
+
+    For each modality:
+        input
+          -> LayerNorm
+          -> Linear -> split [u, z]
+          -> u: DWConv2D + SiLU
+          -> CoupledSS2D(u_rgb, u_ir)
+          -> LayerNorm
+          -> multiply SiLU(z)
+          -> Linear
+          -> own residual
+
+    Finally returns TWO coupled modality representations.
+    Fusion into one LL band is performed outside this block by simple average.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        d_state: int = 16,
+        expand: float = 2.0,
+        d_conv: int = 3,
+        transition_mode: str = "algorithm1",
+    ):
+        super().__init__()
+        if d_conv % 2 == 0:
+            raise ValueError("For 2D same-size DWConv, d_conv must be odd")
+
+        inner = int(channels * expand)
+        self.channels = channels
+        self.inner = inner
+
+        # Structure is symmetric; parameters are NOT shared across modalities.
+        self.norm_in_rgb = nn.LayerNorm(channels)
+        self.norm_in_ir = nn.LayerNorm(channels)
+
+        self.in_proj_rgb = nn.Linear(channels, inner * 2, bias=False)
+        self.in_proj_ir = nn.Linear(channels, inner * 2, bias=False)
+
+        pad = d_conv // 2
+        self.dw_rgb = nn.Conv2d(
+            inner, inner, d_conv, 1, pad, groups=inner, bias=True
+        )
+        self.dw_ir = nn.Conv2d(
+            inner, inner, d_conv, 1, pad, groups=inner, bias=True
+        )
+
+        self.act = nn.SiLU()
+
+        self.coupled_ss2d = CoupledSS2D(
+            d_inner=inner,
+            d_state=d_state,
+            transition_mode=transition_mode,
+        )
+
+        self.norm_out_rgb = nn.LayerNorm(inner)
+        self.norm_out_ir = nn.LayerNorm(inner)
+
+        self.out_proj_rgb = nn.Linear(inner, channels, bias=False)
+        self.out_proj_ir = nn.Linear(inner, channels, bias=False)
+
+    @staticmethod
+    def _nchw_to_bhwc(x):
+        return x.permute(0, 2, 3, 1).contiguous()
+
+    @staticmethod
+    def _bhwc_to_nchw(x):
+        return x.permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, rgb: torch.Tensor, ir: torch.Tensor):
+        if rgb.shape != ir.shape:
+            raise ValueError("RGB and IR LL features must have the same shape")
+        if rgb.ndim != 4:
+            raise ValueError("CoupledVSSBlock2D expects NCHW inputs")
+
+        residual_rgb = rgb
+        residual_ir = ir
+
+        rgb_h = self.norm_in_rgb(self._nchw_to_bhwc(rgb))
+        ir_h = self.norm_in_ir(self._nchw_to_bhwc(ir))
+
+        rgb_u, rgb_z = self.in_proj_rgb(rgb_h).chunk(2, dim=-1)
+        ir_u, ir_z = self.in_proj_ir(ir_h).chunk(2, dim=-1)
+
+        rgb_u = self._bhwc_to_nchw(rgb_u)
+        ir_u = self._bhwc_to_nchw(ir_u)
+
+        rgb_u = self.act(self.dw_rgb(rgb_u))
+        ir_u = self.act(self.dw_ir(ir_u))
+
+        y_rgb, y_ir = self.coupled_ss2d(rgb_u, ir_u)  # BHWC
+
+        y_rgb = self.norm_out_rgb(y_rgb) * F.silu(rgb_z, inplace=False)
+        y_ir = self.norm_out_ir(y_ir) * F.silu(ir_z, inplace=False)
+
+        y_rgb = self.out_proj_rgb(y_rgb)
+        y_ir = self.out_proj_ir(y_ir)
+
+        out_rgb = residual_rgb + self._bhwc_to_nchw(y_rgb)
+        out_ir = residual_ir + self._bhwc_to_nchw(y_ir)
+
+        return out_rgb, out_ir
+
+
+# =============================================================================
+# High-frequency local-energy + signed-consistency fusion
+# =============================================================================
+
+class HighFreqLocalEnergyConsistencyFusion(nn.Module):
+    """
+    Apply independently to one corresponding RGB/IR high-frequency subband.
+
+    1) Local 3x3 energy:
+        E_m = mean_N(H_m^2)
+
+    2) Energy-based soft candidate:
+        w_R = E_R / (E_R + E_I + eps)
+        w_I = E_I / (E_R + E_I + eps)
+        H_soft = w_R H_R + w_I H_I
+
+    3) Dominant signed candidate:
+        H_dom = H_R if E_R >= E_I else H_I
+
+    4) Signed local consistency:
+        C = 2 mean_N(H_R H_I) /
+            (mean_N(H_R^2) + mean_N(H_I^2) + eps)
+
+    5) Continuous consistency coefficient:
+        eta = clamp(C, 0, 1)
+
+    6) Final:
+        H_F = eta H_soft + (1-eta) H_dom
+
+    Original signed coefficients are preserved throughout.
+    There is NO magnitude reconstruction and NO sign recovery.
+    """
+
+    def __init__(self, kernel_size: int = 3, eps: float = 1e-6):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be odd")
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+        self.eps = eps
+
+    def _local_mean(self, x: torch.Tensor) -> torch.Tensor:
+        # count_include_pad=False exactly implements valid-neighbor averaging
+        # at edges/corners without injecting zero-padding into the denominator.
+        return F.avg_pool2d(
+            x,
+            kernel_size=self.kernel_size,
+            stride=1,
+            padding=self.padding,
+            count_include_pad=False,
+        )
+
+    def forward(self, h_rgb: torch.Tensor, h_ir: torch.Tensor):
+        if h_rgb.shape != h_ir.shape:
+            raise ValueError("Corresponding RGB/IR HF bands must have the same shape")
+
+        e_rgb = self._local_mean(h_rgb.square())
+        e_ir = self._local_mean(h_ir.square())
+
+        denom_e = e_rgb + e_ir + self.eps
+        w_rgb = e_rgb / denom_e
+        w_ir = e_ir / denom_e
+
+        h_soft = w_rgb * h_rgb + w_ir * h_ir
+        h_dom = torch.where(e_rgb >= e_ir, h_rgb, h_ir)
+
+        cross = self._local_mean(h_rgb * h_ir)
+        consistency = (2.0 * cross) / (e_rgb + e_ir + self.eps)
+        consistency = consistency.clamp(-1.0, 1.0)
+
+        eta = consistency.clamp(0.0, 1.0)
+        h_fused = eta * h_soft + (1.0 - eta) * h_dom
+
+        return h_fused
+
+
+# =============================================================================
+# Top-level frequency fusion module
+# =============================================================================
+
+class FreqCoupledWaveletFusion(nn.Module):
+    """
+    Input:
+        [rgb_feat, ir_feat], both [B,C,H,W]
+
+    Output:
+        fused feature [B,C,H,W]
+
+    Pipeline:
+        RGB/IR
+          -> Haar DWT
+          -> LL:
+               independent multi-scale enhancement
+               -> Coupled VSS
+               -> average the two coupled outputs
+          -> LH/HL/HH:
+               local energy + signed consistency fusion
+          -> Haar IDWT
+    """
+
+    def __init__(
+        self,
+        c: int,
+        d_state: int = 16,
+        expand: float = 2.0,
+        d_conv: int = 3,
+        hf_kernel: int = 3,
+        transition_mode: str = "algorithm1",
+    ):
+        super().__init__()
+        self.c = c
+
+        self.dwt = HaarDWT2D()
+        self.idwt = HaarIDWT2D()
+
+        self.ll_enh_rgb = MultiScaleLowFreqEnhance(c)
+        self.ll_enh_ir = MultiScaleLowFreqEnhance(c)
+
+        self.ll_coupled = CoupledVSSBlock2D(
+            channels=c,
+            d_state=d_state,
+            expand=expand,
+            d_conv=d_conv,
+            transition_mode=transition_mode,
+        )
+
+        self.hf_fusion = HighFreqLocalEnergyConsistencyFusion(
+            kernel_size=hf_kernel
+        )
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != 2:
+            raise ValueError(
+                "FreqCoupledWaveletFusion expects [rgb_feat, ir_feat]"
+            )
+
+        rgb, ir = x
+        if rgb.shape != ir.shape:
+            raise ValueError(
+                f"RGB/IR shape mismatch: {tuple(rgb.shape)} vs {tuple(ir.shape)}"
+            )
+        if rgb.ndim != 4:
+            raise ValueError("Expected NCHW feature maps")
+        if rgb.shape[1] != self.c:
+            raise ValueError(f"Configured c={self.c}, got input C={rgb.shape[1]}")
+
+        (r_ll, r_lh, r_hl, r_hh), output_hw = self.dwt(rgb)
+        (i_ll, i_lh, i_hl, i_hh), _ = self.dwt(ir)
+
+        # LL: local intra-modal structure -> cross-modal coupled long-range state.
+        r_ll = self.ll_enh_rgb(r_ll)
+        i_ll = self.ll_enh_ir(i_ll)
+
+        r_ll_out, i_ll_out = self.ll_coupled(r_ll, i_ll)
+
+        # V1 keeps the terminal fusion deliberately non-learned.
+        f_ll = 0.5 * (r_ll_out + i_ll_out)
+
+        # HF: each corresponding subband is processed independently.
+        f_lh = self.hf_fusion(r_lh, i_lh)
+        f_hl = self.hf_fusion(r_hl, i_hl)
+        f_hh = self.hf_fusion(r_hh, i_hh)
+
+        return self.idwt(
+            (f_ll, f_lh, f_hl, f_hh),
+            output_hw=output_hw,
+        )

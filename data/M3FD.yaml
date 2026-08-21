@@ -8,14 +8,13 @@
 #     └── coco8  ← downloads here (1 MB)
 
 # Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
-path: /storage/jyx4/projects/dataset/M3FD # dataset root dir
+path: /storage/jyx4/projects/dataset/M3FD_Detection # dataset root dir
 train: images/train # train images (relative to 'path') 4 images
-val: images/val # val images (relative to 'path') 4 images
-test : images/test
+val: images/test # val images (relative to 'path') 4 images
 train_ir: image/train # train images (relative to 'path') 4 images
-val_ir: image/val # val images (relative to 'path') 4 images
-# val_ir: /home/mjy/ultralytics/datasets/OBB_Crop/image/test
-test_ir: image/test # test images (optional)
+val_ir: image/test # val images (relative to 'path') 4 images
+test:
+test_ir:
 
 # Classes
 names:

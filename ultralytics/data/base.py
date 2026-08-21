@@ -4,6 +4,7 @@ import glob
 import math
 import os
 import random
+from collections import Counter
 from copy import deepcopy
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
@@ -67,20 +68,47 @@ class BaseDataset(Dataset):
         """Initialize BaseDataset with given configuration and options."""
         super().__init__()
         self.img_path = img_path
-        self.imgir_path=imgir_path
+        self.imgir_path = imgir_path
         self.imgsz = imgsz
         self.augment = augment
         self.single_cls = single_cls
         self.prefix = prefix
         self.fraction = fraction
-        self.im_files = self.get_img_files(self.img_path)
-        self.imir_files = self.get_img_files(self.imgir_path)
+
+        # ------------------------------------------------------------------
+        # Build RGB-IR pairs explicitly.
+        #
+        # Do NOT infer the IR path from the RGB string (e.g. images -> image)
+        # and do NOT assume both modalities use the same file extension.
+        #
+        # Example supported pair:
+        #   RGB: .../images/train/FLIR_00001.jpg
+        #   IR : .../image/train/FLIR_00001.jpeg
+        #
+        # Pairing is based on the filename stem and the resulting IR list is
+        # reordered to exactly follow the RGB list.
+        # ------------------------------------------------------------------
+        rgb_files = self.get_img_files(self.img_path, apply_fraction=False)
+        ir_files = self.get_img_files(self.imgir_path, apply_fraction=False)
+        self.im_files, self.imir_files = self._pair_modal_files(rgb_files, ir_files)
+
+        # Apply fraction AFTER pairing so RGB and IR can never be sliced
+        # independently into different sample sets.
+        if self.fraction < 1:
+            n = max(1, round(len(self.im_files) * self.fraction))
+            self.im_files = self.im_files[:n]
+            self.imir_files = self.imir_files[:n]
 
         self.labels = self.get_labels()
-        #self.labelsir= self.get_irlabels()
         self.update_labels(include_class=classes)  # single_cls and include_class
 
         self.ni = len(self.labels)  # number of images
+        if self.ni != len(self.im_files):
+            raise RuntimeError(
+                f"{self.prefix}RGB/label count mismatch after pairing: "
+                f"{len(self.im_files)} RGB pairs vs {self.ni} labels."
+            )
+
         self.rect = rect
         self.batch_size = batch_size
         self.stride = stride
@@ -90,52 +118,203 @@ class BaseDataset(Dataset):
             self.set_rectangle()
 
         # Buffer thread for mosaic images
-        self.buffer = []  # buffer size = batch size
+        self.buffer = []
         self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0
 
-        # Cache images (options are cache = True, False, None, "ram", "disk")
-        self.ims,self.imsir, self.im_hw0, self.im_hw = [None] * self.ni,[None] * self.ni, [None] * self.ni, [None] * self.ni
-        self.npy_files = [Path(f).with_suffix(".npy") for f in self.im_files]
-        #self.npyir_files = [Path(f).with_suffix(".npy") for f in self.imir_files]
+        # Cache the COMBINED RGB-IR tensor.
+        # Use a dedicated suffix to avoid accidentally reading legacy RGB-only
+        # .npy files produced by older versions of this loader.
+        self.ims = [None] * self.ni
+        self.imsir = [None] * self.ni  # kept for backward compatibility
+        self.im_hw0 = [None] * self.ni
+        self.im_hw = [None] * self.ni
+        self.npy_files = [Path(f).with_suffix(".rgbir.npy") for f in self.im_files]
+        self.npyir_files = [Path(f).with_suffix(".ir.npy") for f in self.imir_files]
 
         self.cache = cache.lower() if isinstance(cache, str) else "ram" if cache is True else None
         if (self.cache == "ram" and self.check_cache_ram()) or self.cache == "disk":
             self.cache_images()
-            #self.cacheir_images()
 
         # Transforms
         self.transforms = self.build_transforms(hyp=hyp)
 
-    def get_img_files(self, img_path):
-        """Read image files."""
+    def get_img_files(self, img_path, apply_fraction=True):
+        """Read image files from a directory, a txt file, or a list of either."""
         try:
-            f = []  # image files
-            for p in img_path if isinstance(img_path, list) else [img_path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / "**" / "*.*"), recursive=True)
-                    # F = list(p.rglob('*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p) as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace("./", parent) if x.startswith("./") else x for x in t]  # local to global path
-                        # F += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
+            files = []
+            sources = img_path if isinstance(img_path, list) else [img_path]
+
+            for source in sources:
+                p = Path(source)
+
+                if p.is_dir():
+                    files += glob.glob(str(p / "**" / "*.*"), recursive=True)
+
+                elif p.is_file():
+                    with open(p, encoding="utf-8") as t:
+                        entries = t.read().strip().splitlines()
+
+                    parent = str(p.parent) + os.sep
+                    files += [
+                        x.replace("./", parent) if x.startswith("./") else x
+                        for x in entries
+                    ]
+
                 else:
                     raise FileNotFoundError(f"{self.prefix}{p} does not exist")
-            im_files = sorted(x.replace("/", os.sep) for x in f if x.split(".")[-1].lower() in IMG_FORMATS)
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
+
+            im_files = sorted(
+                os.path.normpath(x)
+                for x in files
+                if Path(x).suffix[1:].lower() in IMG_FORMATS
+            )
+
             assert im_files, f"{self.prefix}No images found in {img_path}. {FORMATS_HELP_MSG}"
+
         except Exception as e:
- 
-            raise FileNotFoundError(f"{self.prefix}Error loading data from {img_path}\n{HELP_URL}") from e
-        if self.fraction < 1:
-            im_files = im_files[: round(len(im_files) * self.fraction)]  # retain a fraction of the dataset
+            raise FileNotFoundError(
+                f"{self.prefix}Error loading data from {img_path}\n{HELP_URL}"
+            ) from e
+
+        if apply_fraction and self.fraction < 1:
+            im_files = im_files[: max(1, round(len(im_files) * self.fraction))]
+
         return im_files
 
+    @staticmethod
+    def _modal_pair_key(file_path):
+        """
+        Return the modality-independent sample key.
 
+        File extensions are deliberately ignored:
+            xxx.jpg, xxx.jpeg, xxx.PNG -> key 'xxx'
 
-    
+        casefold() also makes filename matching robust to case differences.
+        """
+        return Path(file_path).stem.casefold()
+
+    def _pair_modal_files(self, rgb_files, ir_files):
+        """
+        Pair RGB and IR images by filename stem, independent of extension.
+
+        The returned IR list is reordered to follow RGB order exactly.
+
+        This intentionally fails loudly on:
+          - duplicated stems within one modality;
+          - an RGB image with no matching IR image.
+
+        Silent index-based pairing is much more dangerous for multispectral
+        training because one missing file can shift every subsequent pair.
+        """
+        def build_unique_map(files, modality):
+            mapping = {}
+            duplicates = {}
+
+            for file_path in files:
+                key = self._modal_pair_key(file_path)
+                if key in mapping:
+                    duplicates.setdefault(key, [mapping[key]]).append(file_path)
+                else:
+                    mapping[key] = file_path
+
+            if duplicates:
+                preview = "\n".join(
+                    f"  {key}: {paths}"
+                    for key, paths in list(duplicates.items())[:10]
+                )
+                raise RuntimeError(
+                    f"{self.prefix}{modality} contains duplicated filename stems. "
+                    f"Pairing would be ambiguous. First duplicates:\n{preview}"
+                )
+
+            return mapping
+
+        rgb_map = build_unique_map(rgb_files, "RGB")
+        ir_map = build_unique_map(ir_files, "IR")
+
+        paired_rgb = []
+        paired_ir = []
+        missing_ir = []
+
+        # Keep the original sorted RGB order because labels are generated from
+        # self.im_files and must stay aligned with it.
+        for rgb_file in rgb_files:
+            key = self._modal_pair_key(rgb_file)
+            ir_file = ir_map.get(key)
+
+            if ir_file is None:
+                missing_ir.append(rgb_file)
+                continue
+
+            paired_rgb.append(rgb_file)
+            paired_ir.append(ir_file)
+
+        if missing_ir:
+            preview = "\n".join(f"  {x}" for x in missing_ir[:20])
+            raise FileNotFoundError(
+                f"{self.prefix}Found {len(missing_ir)} RGB images without a matching IR image. "
+                f"Matching ignores extensions and uses filename stems. "
+                f"First missing RGB files:\n{preview}"
+            )
+
+        # Extra IR files do not corrupt pairing, but report them because they
+        # usually indicate an incomplete RGB side or a stale dataset file.
+        rgb_keys = set(rgb_map)
+        extra_ir_keys = set(ir_map) - rgb_keys
+        if extra_ir_keys:
+            examples = [ir_map[k] for k in sorted(extra_ir_keys)[:10]]
+            LOGGER.warning(
+                f"{self.prefix}WARNING ⚠️ {len(extra_ir_keys)} IR images have no RGB counterpart "
+                f"and will be ignored. Examples: {examples}"
+            )
+
+        if not paired_rgb:
+            raise RuntimeError(f"{self.prefix}No valid RGB-IR pairs were found.")
+
+        rgb_ext = Counter(Path(x).suffix.lower() for x in paired_rgb)
+        ir_ext = Counter(Path(x).suffix.lower() for x in paired_ir)
+
+        LOGGER.info(
+            f"{self.prefix}RGB-IR pairs: {len(paired_rgb)} | "
+            f"RGB extensions: {dict(rgb_ext)} | IR extensions: {dict(ir_ext)}"
+        )
+
+        return paired_rgb, paired_ir
+
+    def _read_rgb_ir_pair(self, i):
+        """
+        Read one aligned RGB-IR pair and concatenate to a 6-channel array.
+
+        Shape mismatch is treated as a dataset error instead of silently
+        resizing one modality, since an implicit resize can invalidate
+        multispectral alignment.
+        """
+        rgb_file = self.im_files[i]
+        ir_file = self.imir_files[i]
+
+        rgb = cv2.imread(rgb_file, cv2.IMREAD_COLOR)
+        if rgb is None:
+            raise FileNotFoundError(
+                f"{self.prefix}Cannot read RGB image: {rgb_file}"
+            )
+
+        ir = cv2.imread(ir_file, cv2.IMREAD_COLOR)
+        if ir is None:
+            raise FileNotFoundError(
+                f"{self.prefix}Cannot read IR image: {ir_file}"
+            )
+
+        if rgb.shape[:2] != ir.shape[:2]:
+            raise ValueError(
+                f"{self.prefix}RGB/IR shape mismatch for paired sample:\n"
+                f"  RGB: {rgb_file} -> {rgb.shape}\n"
+                f"  IR : {ir_file} -> {ir.shape}\n"
+                "Please align/resize the dataset before training. "
+                "The loader will not silently resize one modality."
+            )
+
+        return np.concatenate((rgb, ir), axis=2)
+
     def update_labels(self, include_class: Optional[list]):
         """Update labels to include only these classes (optional)."""
         include_class_array = np.array(include_class).reshape(1, -1)
@@ -156,52 +335,54 @@ class BaseDataset(Dataset):
                 self.labels[i]["cls"][:, 0] = 0
 
     def load_image(self, i, rect_mode=True):
-        """Loads 1 image from dataset index 'i', returns (im, resized hw)."""
-        im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i]
-        
-        #f1=self.imir_files[i]
-        f1=self.im_files[i].replace('images','image')
-        imir=cv2.imread(f1)
-        
-        #imir=cv2.cvtColor(imir,cv2.COLOR_BGR2GRAY) #转化为i灰度图像
+        """Load one paired RGB-IR sample as a 6-channel image."""
+        im = self.ims[i]
+        fn = self.npy_files[i]
 
-        # if imir.ndim == 2:  
-        #     imir = imir[:, :, np.newaxis]  # 添加一个通道维度
-        
         if im is None:  # not cached in RAM
-            if fn.exists():  # load npy
+            if fn.exists():
                 try:
                     im = np.load(fn)
+                    # Guard against stale RGB-only caches from manual edits.
+                    if im.ndim != 3 or im.shape[2] != 6:
+                        raise ValueError(
+                            f"expected 6-channel RGB-IR cache, got shape {im.shape}"
+                        )
                 except Exception as e:
-                    LOGGER.warning(f"{self.prefix}WARNING ⚠️ Removing corrupt *.npy image file {fn} due to: {e}")
+                    LOGGER.warning(
+                        f"{self.prefix}WARNING ⚠️ Removing invalid RGB-IR cache {fn} due to: {e}"
+                    )
                     Path(fn).unlink(missing_ok=True)
-                    im = cv2.imread(f)  # BGR
-            else:  # read image
-                im = cv2.imread(f)  # BGR
-            if im is None:
-                raise FileNotFoundError(f"Image Not Found {f}")
+                    im = self._read_rgb_ir_pair(i)
+            else:
+                im = self._read_rgb_ir_pair(i)
 
-            # import matplotlib.pyplot as plt  
+            h0, w0 = im.shape[:2]
 
-            # plt.imshow(im)
-            # plt.savefig('/home/mjy/ultralytics/images/'+str(i)+'rgb.jpg')
-            # plt.close()
-
-            # cv2.imwrite('/home/mjy/ultralytics/images/'+str(i)+'ir.jpg', imir) #保存
-            im = np.dstack((im, imir))
-            h0, w0 = im.shape[:2]  # orig hw
-            if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
-                r = self.imgsz / max(h0, w0)  # ratio
-                if r != 1:  # if sizes are not equal
-                    w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+            if rect_mode:
+                r = self.imgsz / max(h0, w0)
+                if r != 1:
+                    w, h = (
+                        min(math.ceil(w0 * r), self.imgsz),
+                        min(math.ceil(h0 * r), self.imgsz),
+                    )
                     im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
-            elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
-                im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
 
-            # Add to buffer if training with augmentations
+            elif not (h0 == w0 == self.imgsz):
+                im = cv2.resize(
+                    im,
+                    (self.imgsz, self.imgsz),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
             if self.augment:
-                self.ims[i], self.im_hw0[i], self.im_hw[i] = im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
+                self.ims[i], self.im_hw0[i], self.im_hw[i] = (
+                    im,
+                    (h0, w0),
+                    im.shape[:2],
+                )
                 self.buffer.append(i)
+
                 if len(self.buffer) >= self.max_buffer_length:
                     j = self.buffer.pop(0)
                     if self.cache != "ram":
@@ -212,119 +393,136 @@ class BaseDataset(Dataset):
         return self.ims[i], self.im_hw0[i], self.im_hw[i]
 
     def loadir_image(self, i, rect_mode=True):
-        """Loads 1 image from dataset index 'i', returns (im, resized hw)."""
-        im, f, fn = self.imsir[i], self.imir_files[i], self.npyir_files[i]
-        if im is None:  # not cached in RAM
-            if fn.exists():  # load npy
-                try:
-                    im = np.load(fn)
-                except Exception as e:
-                    LOGGER.warning(f"{self.prefix}WARNING ⚠️ Removing corrupt *.npy image file {fn} due to: {e}")
-                    Path(fn).unlink(missing_ok=True)
-                    im = cv2.imread(f,cv2.IMREAD_GRAYSCALE)  # BGR
-            else:  # read image
-                im = cv2.imread(f,cv2.IMREAD_GRAYSCALE)  # BGR
-            if im is None:
-                raise FileNotFoundError(f"Image Not Found {f}")
-            h0, w0 = im.shape[:2]  # orig hw
-            if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
-                r = self.imgsz / max(h0, w0)  # ratio
-                if r != 1:  # if sizes are not equal
-                    w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
-                    im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
-            elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
-                im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+        """
+        Backward-compatible standalone IR loader.
 
-            # Add to buffer if training with augmentations
-            if self.augment:
-                self.imsir[i], self.im_hw0[i], self.im_hw[i] = im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
-                self.buffer.append(i)
-                if len(self.buffer) >= self.max_buffer_length:
-                    j = self.buffer.pop(0)
-                    if self.cache != "ram":
-                        self.imsir[j], self.im_hw0[j], self.im_hw[j] = None, None, None
+        Main multispectral training should use load_image(), which loads the
+        already paired RGB and IR files together.
+        """
+        im = self.imsir[i]
+        f = self.imir_files[i]
+
+        if im is None:
+            im = cv2.imread(f, cv2.IMREAD_COLOR)
+            if im is None:
+                raise FileNotFoundError(f"{self.prefix}Cannot read IR image: {f}")
+
+            h0, w0 = im.shape[:2]
+
+            if rect_mode:
+                r = self.imgsz / max(h0, w0)
+                if r != 1:
+                    w, h = (
+                        min(math.ceil(w0 * r), self.imgsz),
+                        min(math.ceil(h0 * r), self.imgsz),
+                    )
+                    im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+
+            elif not (h0 == w0 == self.imgsz):
+                im = cv2.resize(
+                    im,
+                    (self.imgsz, self.imgsz),
+                    interpolation=cv2.INTER_LINEAR,
+                )
 
             return im, (h0, w0), im.shape[:2]
 
         return self.imsir[i], self.im_hw0[i], self.im_hw[i]
 
     def cache_images(self):
-        """Cache images to memory or disk."""
-        b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
-        fcn, storage = (self.cache_images_to_disk, "Disk") if self.cache == "disk" else (self.load_image, "RAM")
+        """Cache paired 6-channel RGB-IR samples to RAM or disk."""
+        b, gb = 0, 1 << 30
+        fcn, storage = (
+            (self.cache_images_to_disk, "Disk")
+            if self.cache == "disk"
+            else (self.load_image, "RAM")
+        )
+
         with ThreadPool(NUM_THREADS) as pool:
             results = pool.imap(fcn, range(self.ni))
-            pbar = TQDM(enumerate(results), total=self.ni, disable=LOCAL_RANK > 0)
+            pbar = TQDM(
+                enumerate(results),
+                total=self.ni,
+                disable=LOCAL_RANK > 0,
+            )
+
             for i, x in pbar:
                 if self.cache == "disk":
                     b += self.npy_files[i].stat().st_size
-                else:  # 'ram'
-                    self.ims[i], self.im_hw0[i], self.im_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
+                else:
+                    self.ims[i], self.im_hw0[i], self.im_hw[i] = x
                     b += self.ims[i].nbytes
-                pbar.desc = f"{self.prefix}Caching images ({b / gb:.1f}GB {storage})"
+
+                pbar.desc = (
+                    f"{self.prefix}Caching RGB-IR pairs "
+                    f"({b / gb:.1f}GB {storage})"
+                )
+
             pbar.close()
 
-    def cacheir_images(self):
-        """Cache images to memory or disk."""
-        b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
-
-        fcn, storage = (self.cacheir_images_to_disk, "Disk") if self.cache == "disk" else (self.loadir_image, "RAM")
-        with ThreadPool(NUM_THREADS) as pool:
-            results = pool.imap(fcn, range(self.ni))
-            pbar = TQDM(enumerate(results), total=self.ni, disable=LOCAL_RANK > 0)
-            for i, x in pbar:
-                if self.cache == "disk":
-                    b += self.npyir_files[i].stat().st_size
-                else:  # 'ram'
-                    self.imsir[i], self.im_hw0[i], self.im_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
-                    b += self.imsir[i].nbytes
-                pbar.desc = f"{self.prefix}Caching images ({b / gb:.1f}GB {storage})"
-            pbar.close()
-
-    def cache_images(self):
-        """Cache images to memory or disk."""
-        b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
-        fcn, storage = (self.cache_images_to_disk, "Disk") if self.cache == "disk" else (self.load_image, "RAM")
-        with ThreadPool(NUM_THREADS) as pool:
-            results = pool.imap(fcn, range(self.ni))
-            pbar = TQDM(enumerate(results), total=self.ni, disable=LOCAL_RANK > 0)
-            for i, x in pbar:
-                if self.cache == "disk":
-                    b += self.npy_files[i].stat().st_size
-                else:  # 'ram'
-                    self.ims[i], self.im_hw0[i], self.im_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
-                    b += self.ims[i].nbytes
-                pbar.desc = f"{self.prefix}Caching images ({b / gb:.1f}GB {storage})"
-            pbar.close()
     def cache_images_to_disk(self, i):
-        """Saves an image as an *.npy file for faster loading."""
+        """Save the complete paired 6-channel sample as *.rgbir.npy."""
         f = self.npy_files[i]
         if not f.exists():
-            np.save(f.as_posix(), cv2.imread(self.im_files[i]), allow_pickle=False)
+            im = self._read_rgb_ir_pair(i)
+            np.save(f.as_posix(), im, allow_pickle=False)
+
+    def cacheir_images(self):
+        """Backward-compatible IR-only RAM cache."""
+        b, gb = 0, 1 << 30
+
+        with ThreadPool(NUM_THREADS) as pool:
+            results = pool.imap(self.loadir_image, range(self.ni))
+            pbar = TQDM(
+                enumerate(results),
+                total=self.ni,
+                disable=LOCAL_RANK > 0,
+            )
+
+            for i, x in pbar:
+                self.imsir[i], _, _ = x
+                b += self.imsir[i].nbytes
+                pbar.desc = f"{self.prefix}Caching IR images ({b / gb:.1f}GB RAM)"
+
+            pbar.close()
+
     def cacheir_images_to_disk(self, i):
-        """Saves an image as an *.npy file for faster loading."""
+        """Backward-compatible standalone IR disk cache."""
         f = self.npyir_files[i]
         if not f.exists():
-            np.save(f.as_posix(), cv2.imread(self.imir_files[i]), allow_pickle=False)
+            im = cv2.imread(self.imir_files[i], cv2.IMREAD_COLOR)
+            if im is None:
+                raise FileNotFoundError(
+                    f"{self.prefix}Cannot read IR image: {self.imir_files[i]}"
+                )
+            np.save(f.as_posix(), im, allow_pickle=False)
 
     def check_cache_ram(self, safety_margin=0.5):
-        """Check image caching requirements vs available memory."""
-        b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
-        n = min(self.ni, 30)  # extrapolate from 30 random images
-        for _ in range(n):
-            im = cv2.imread(random.choice(self.im_files))  # sample image
-            ratio = self.imgsz / max(im.shape[0], im.shape[1])  # max(h, w)  # ratio
+        """Estimate RAM required for caching paired 6-channel RGB-IR images."""
+        b, gb = 0, 1 << 30
+        n = min(self.ni, 30)
+
+        if n == 0:
+            return False
+
+        for i in random.sample(range(self.ni), n):
+            im = self._read_rgb_ir_pair(i)
+            ratio = self.imgsz / max(im.shape[0], im.shape[1])
             b += im.nbytes * ratio**2
-        mem_required = b * self.ni / n * (1 + safety_margin)  # GB required to cache dataset into RAM
+
+        mem_required = b * self.ni / n * (1 + safety_margin)
         mem = psutil.virtual_memory()
-        success = mem_required < mem.available  # to cache or not to cache, that is the question
+        success = mem_required < mem.available
+
         if not success:
             self.cache = None
             LOGGER.info(
-                f"{self.prefix}{mem_required / gb:.1f}GB RAM required to cache images "
+                f"{self.prefix}{mem_required / gb:.1f}GB RAM required to cache RGB-IR pairs "
                 f"with {int(safety_margin * 100)}% safety margin but only "
-                f"{mem.available / gb:.1f}/{mem.total / gb:.1f}GB available, not caching images ⚠️"
+                f"{mem.available / gb:.1f}/{mem.total / gb:.1f}GB available, "
+                "not caching images ⚠️"
             )
+
         return success
 
     def set_rectangle(self):

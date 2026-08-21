@@ -120,7 +120,7 @@ def write_temp_yaml(data):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=str, default="/storage/jyx4/projects/TwoStream_Yolov8-main/runs/dronevehicle/obb/LASCI_add/weights/best.pt", 
+    parser.add_argument("--weights", type=str, default="/storage/jyx4/projects/TwoStream_Yolov8-main/runs/dronevehicle/moe/full_hf_nobalance/weights/best.pt", 
                         help="模型权重路径")
     parser.add_argument("--data", type=str, default="/storage/jyx4/projects/TwoStream_Yolov8-main/data/dronevehicle_obb.yaml", 
                         help="数据集 yaml 路径")
@@ -129,11 +129,11 @@ def parse_args():
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--conf", type=float, default=0.25)
-    parser.add_argument("--iou", type=float, default=0.7)
+    parser.add_argument("--conf", type=float, default=0.05)
+    parser.add_argument("--iou", type=float, default=0.5)
     parser.add_argument("--max-det", type=int, default=300)
     parser.add_argument("--project", type=str, default="runs/test", help="结果保存的父目录")
-    parser.add_argument("--name", type=str, default="LASCI_add", help="本次实验保存的子目录名")
+    parser.add_argument("--name", type=str, default="fullv1_hf_nobalance", help="本次实验保存的子目录名")
     parser.add_argument("--save-json", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()

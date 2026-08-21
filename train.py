@@ -101,6 +101,7 @@ def train_once(args, batch_size):
         plots=True,
         save=True,
         val=True,
+        iou=0.5,
     )
 
     # 可选参数：resume
@@ -162,7 +163,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Robust Ultralytics YOLO Training Script")
 
     parser.add_argument("--model", type=str,
-                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/new_ACM/LASCI_cos.yaml",
+                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/frequency/FreqCoupledWavelet_parallel_obb.yaml",
                         help="模型结构 yaml 或权重 pt 路径")
     parser.add_argument("--data", type=str,
                         default="/storage/jyx4/projects/TwoStream_Yolov8-main/data/dronevehicle_obb.yaml",
@@ -170,12 +171,12 @@ def parse_args():
 
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--workers", type=int, default=8)
 
-    parser.add_argument("--project", type=str, default="runs/dronevehicle/obb")
-    parser.add_argument("--name", type=str, default="LASCI_cos")
+    parser.add_argument("--project", type=str, default="runs/dronevehicle/coupledwavelet")
+    parser.add_argument("--name", type=str, default="FreqCoupledWavelet_parallel_obb")
     parser.add_argument("--exist-ok", action="store_true")
 
     parser.add_argument("--resume", action="store_true")

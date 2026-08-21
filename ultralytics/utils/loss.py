@@ -11,6 +11,8 @@ from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigne
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 import os
+import csv
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -192,6 +194,13 @@ class v8DetectionLoss:
         self.lowlight_neg_lambda = 0.30  # 降权强度
         self.lowlight_neg_floor = 0.35   # 负样本最小权重，防止完全不学
 
+        # =========================================================
+        # Generic Frequency-MoE auxiliary loss / debug
+        # =========================================================
+        # MoE 与 HBB / OBB 的框类型无关，因此统一放在 DetectionLoss 父类。
+        self.model = model
+        self._init_moe_aux()
+
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
         if targets.shape[0] == 0:
@@ -296,7 +305,12 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        # Generic Frequency-MoE auxiliary loss.
+        # loss.detach() 仍只保留 box / cls / dfl，避免改变 trainer 日志格式。
+        total_loss = loss.sum()
+        total_loss = self._apply_moe_aux(total_loss)
+
+        return total_loss * batch_size, loss.detach()  # loss(box, cls, dfl)
     
     def _rgb_lowlight_score(self, imgs):
         """
@@ -376,6 +390,510 @@ class v8DetectionLoss:
         # 正样本保持1，只有负样本降权
         full_weight = 1.0 - neg_mask + neg_mask * neg_weight
         return full_weight
+
+
+    # =============================================================
+    # Frequency-MoE auxiliary loss / debug
+    # =============================================================
+
+    def _init_moe_aux(self):
+        """
+        Initialize generic Frequency-MoE balance/debug configuration.
+
+        The MoE fusion mechanism is independent of HBB/OBB, so its loss and
+        debug logic lives in v8DetectionLoss and is shared by v8OBBLoss.
+
+        Segment/Pose inherit these helpers, but cache is only enabled for
+        Detect/OBB heads to avoid retaining unused autograd graphs.
+        """
+        head_name = self.model.model[-1].__class__.__name__.lower()
+        self.moe_task_enable = head_name in {"detect", "obb"}
+
+        # ---------------- Balance config ----------------
+        self.moe_balance_enable = False
+
+        self.moe_ll_balance_gain = float(
+            os.getenv("MOE_LL_BALANCE_GAIN", "0.01")
+        )
+        self.moe_hf_balance_gain = float(
+            os.getenv("MOE_HF_BALANCE_GAIN", "0.01")
+        )
+
+        # Legacy module fallback.
+        self.moe_balance_gain = float(
+            os.getenv("MOE_BALANCE_GAIN", "0.01")
+        )
+
+        # ---------------- CSV debug config ----------------
+        self.moe_debug_enable = bool(
+            int(os.getenv("MOE_DEBUG_ENABLE", "1"))
+        )
+        self.moe_debug_interval = int(
+            os.getenv("MOE_DEBUG_INTERVAL", "200")
+        )
+        self.moe_debug_dir = Path(
+            os.getenv("MOE_DEBUG_DIR", "runs/moe_debug")
+        )
+        self.moe_exp_name = os.getenv(
+            "MOE_EXP_NAME", "default"
+        )
+
+        # Parallel experiments must never append to one folder.
+        self.moe_debug_run_id = (
+            datetime.now().strftime("%Y%m%d_%H%M%S")
+            + f"_pid{os.getpid()}"
+        )
+        self._moe_debug_step = 0
+
+        # MoE modules cache router/balance tensors during model forward.
+        if self.moe_task_enable:
+            cache_enable = bool(
+                self.moe_balance_enable or self.moe_debug_enable
+            )
+            for module in self.model.modules():
+                if hasattr(module, "cache_moe_aux"):
+                    module.cache_moe_aux = cache_enable
+
+    def _collect_moe_aux(self):
+        """
+        Collect cached band-specific balance terms and router debug.
+
+        New modules:
+            last_moe_balance_terms = {ll, lh, hl, hh}
+
+        Same-band terms from P3/P4/P5 are averaged.
+
+        Legacy modules:
+            last_moe_balance_loss
+        """
+        band_terms = {}
+        fallback_terms = []
+        debug_rows = []
+
+        for module_idx, module in enumerate(self.model.modules()):
+            terms = getattr(
+                module, "last_moe_balance_terms", None
+            )
+
+            if isinstance(terms, dict):
+                for band, value in terms.items():
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    band = str(band).lower()
+                    band_terms.setdefault(band, []).append(
+                        value.reshape(())
+                    )
+            else:
+                fallback = getattr(
+                    module, "last_moe_balance_loss", None
+                )
+                if isinstance(fallback, torch.Tensor):
+                    fallback_terms.append(
+                        fallback.reshape(())
+                    )
+
+            stats = getattr(
+                module, "last_moe_debug_stats", None
+            )
+            if isinstance(stats, (list, tuple)):
+                for item in stats:
+                    if not isinstance(item, dict):
+                        continue
+
+                    row = dict(item)
+                    row.setdefault("module_idx", module_idx)
+                    row.setdefault(
+                        "module_name",
+                        module.__class__.__name__,
+                    )
+                    row.setdefault(
+                        "variant",
+                        getattr(
+                            module,
+                            "moe_variant",
+                            "unknown",
+                        ),
+                    )
+                    debug_rows.append(row)
+
+        band_mean = {
+            band: torch.stack(values).mean()
+            for band, values in band_terms.items()
+            if values
+        }
+
+        fallback_mean = (
+            torch.stack(fallback_terms).mean()
+            if fallback_terms
+            else None
+        )
+
+        return band_mean, fallback_mean, debug_rows
+
+    def _clear_moe_aux_cache(self):
+        """Clear cached tensors attached to the current autograd graph."""
+        for module in self.model.modules():
+            if hasattr(module, "last_moe_balance_loss"):
+                module.last_moe_balance_loss = None
+            if hasattr(module, "last_moe_balance_terms"):
+                module.last_moe_balance_terms = None
+            if hasattr(module, "last_moe_debug_stats"):
+                module.last_moe_debug_stats = None
+
+    @staticmethod
+    def _moe_to_float(x, default=0.0):
+        if isinstance(x, torch.Tensor):
+            if x.numel() == 0:
+                return float(default)
+            return float(
+                x.detach().float().mean().cpu()
+            )
+        if x is None:
+            return float(default)
+        return float(x)
+
+    @staticmethod
+    def _moe_to_list(x):
+        if isinstance(x, torch.Tensor):
+            return (
+                x.detach().float().flatten().cpu().tolist()
+            )
+        if isinstance(x, np.ndarray):
+            return x.reshape(-1).astype(float).tolist()
+        if isinstance(x, (list, tuple)):
+            return [float(v) for v in x]
+        return []
+
+    def _apply_moe_aux(self, total_loss):
+        """
+        Add MoE balance loss and write debug for both HBB and OBB.
+
+        Full-independent/V2 normalization is intentionally kept identical
+        to the old OBB implementation:
+
+            0.25 * [
+                lambda_LL * LL
+                + lambda_HF * (LH + HL + HH)
+            ]
+
+        Therefore HF=0 does not accidentally make the LL auxiliary term
+        four times stronger.
+        """
+        if not self.moe_task_enable:
+            return total_loss
+
+        try:
+            (
+                band_losses,
+                fallback_loss,
+                debug_rows,
+            ) = self._collect_moe_aux()
+
+            raw_moe_loss = None
+            weighted_moe_loss = None
+
+            if band_losses:
+                zero = next(
+                    iter(band_losses.values())
+                ).new_tensor(0.0)
+
+                l_ll = band_losses.get("ll", zero)
+                l_lh = band_losses.get("lh", zero)
+                l_hl = band_losses.get("hl", zero)
+                l_hh = band_losses.get("hh", zero)
+
+                # Raw four-band mean: debug only.
+                raw_moe_loss = 0.25 * (
+                    l_ll + l_lh + l_hl + l_hh
+                )
+
+                # Actual optimization term.
+                weighted_moe_loss = 0.25 * (
+                    self.moe_ll_balance_gain * l_ll
+                    + self.moe_hf_balance_gain
+                    * (l_lh + l_hl + l_hh)
+                )
+
+            elif fallback_loss is not None:
+                raw_moe_loss = fallback_loss
+                weighted_moe_loss = (
+                    self.moe_balance_gain * fallback_loss
+                )
+
+            if (
+                self.model.training
+                and weighted_moe_loss is not None
+            ):
+                total_loss = total_loss + weighted_moe_loss
+
+            # Validation / EMA do not create another debug stream.
+            if self.model.training:
+                self._maybe_write_moe_debug(
+                    debug_rows=debug_rows,
+                    raw_moe_balance_loss=raw_moe_loss,
+                    weighted_moe_balance_loss=weighted_moe_loss,
+                )
+
+            return total_loss
+
+        finally:
+            self._clear_moe_aux_cache()
+
+    def _maybe_write_moe_debug(
+        self,
+        debug_rows,
+        raw_moe_balance_loss=None,
+        weighted_moe_balance_loss=None,
+    ):
+        """
+        Write MoE routing statistics to CSV.
+
+        Directory:
+            runs/moe_debug/<variant>/<MOE_EXP_NAME>/<run_id>/
+                router_stats.csv
+                balance_loss.csv
+
+        balance_loss.csv:
+            balance_loss
+                raw unweighted four-band mean
+
+            weighted_balance_loss
+                the ACTUAL auxiliary value added to total loss
+
+        The old file multiplied an already weighted loss by 0.01 again only
+        while writing CSV. That bookkeeping bug is corrected here; it never
+        affected optimization.
+        """
+        if not self.moe_debug_enable:
+            return
+
+        rank = int(os.environ.get("RANK", "0"))
+        if rank not in (-1, 0):
+            return
+
+        self._moe_debug_step += 1
+        if self._moe_debug_step % self.moe_debug_interval != 0:
+            return
+
+        if (
+            not debug_rows
+            and raw_moe_balance_loss is None
+            and weighted_moe_balance_loss is None
+        ):
+            return
+
+        variant = "unknown"
+        if debug_rows:
+            variant = str(
+                debug_rows[0].get("variant", "unknown")
+            )
+
+        variant = (
+            variant.replace("/", "_")
+            .replace("\\", "_")
+            .replace(" ", "_")
+        )
+
+        save_dir = (
+            self.moe_debug_dir
+            / variant
+            / self.moe_exp_name
+            / self.moe_debug_run_id
+        )
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---------------- router_stats.csv ----------------
+        if debug_rows:
+            router_file = save_dir / "router_stats.csv"
+            router_exists = router_file.exists()
+
+            fieldnames = [
+                "step",
+                "variant",
+                "module_idx",
+                "module_name",
+                "bank",
+                "route",
+                "feature_h",
+                "feature_w",
+                "expert_id",
+                "prob_mean",
+                "prob_std",
+                "selection_rate",
+                "selected_weight_mean",
+                "router_entropy",
+                "top2_top3_margin",
+                "pair_01",
+                "pair_02",
+                "pair_03",
+                "pair_12",
+                "pair_13",
+                "pair_23",
+                "balance_loss",
+            ]
+
+            with router_file.open(
+                "a", newline="", encoding="utf-8"
+            ) as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=fieldnames
+                )
+                if not router_exists:
+                    writer.writeheader()
+
+                for row in debug_rows:
+                    probs = self._moe_to_list(
+                        row.get("prob_mean")
+                    )
+                    prob_stds = self._moe_to_list(
+                        row.get("prob_std")
+                    )
+                    sels = self._moe_to_list(
+                        row.get("selection_rate")
+                    )
+                    weights = self._moe_to_list(
+                        row.get("selected_weight_mean")
+                    )
+
+                    margin = self._moe_to_float(
+                        row.get("top2_top3_margin")
+                    )
+                    entropy = self._moe_to_float(
+                        row.get("entropy")
+                    )
+                    balance = self._moe_to_float(
+                        row.get("balance_loss")
+                    )
+
+                    pair_values = {
+                        key: self._moe_to_float(
+                            row.get(key)
+                        )
+                        for key in (
+                            "pair_01",
+                            "pair_02",
+                            "pair_03",
+                            "pair_12",
+                            "pair_13",
+                            "pair_23",
+                        )
+                    }
+
+                    n_experts = max(
+                        len(probs),
+                        len(prob_stds),
+                        len(sels),
+                        len(weights),
+                    )
+
+                    for expert_id in range(n_experts):
+                        writer.writerow(
+                            {
+                                "step":
+                                    self._moe_debug_step,
+                                "variant":
+                                    row.get(
+                                        "variant", variant
+                                    ),
+                                "module_idx":
+                                    row.get(
+                                        "module_idx", -1
+                                    ),
+                                "module_name":
+                                    row.get(
+                                        "module_name", ""
+                                    ),
+                                "bank":
+                                    row.get("bank", ""),
+                                "route":
+                                    row.get("route", ""),
+                                "feature_h":
+                                    row.get(
+                                        "feature_h", -1
+                                    ),
+                                "feature_w":
+                                    row.get(
+                                        "feature_w", -1
+                                    ),
+                                "expert_id":
+                                    expert_id,
+                                "prob_mean":
+                                    probs[expert_id]
+                                    if expert_id < len(probs)
+                                    else 0.0,
+                                "prob_std":
+                                    prob_stds[expert_id]
+                                    if expert_id < len(prob_stds)
+                                    else 0.0,
+                                "selection_rate":
+                                    sels[expert_id]
+                                    if expert_id < len(sels)
+                                    else 0.0,
+                                "selected_weight_mean":
+                                    weights[expert_id]
+                                    if expert_id < len(weights)
+                                    else 0.0,
+                                "router_entropy":
+                                    entropy,
+                                "top2_top3_margin":
+                                    margin,
+                                "pair_01":
+                                    pair_values["pair_01"],
+                                "pair_02":
+                                    pair_values["pair_02"],
+                                "pair_03":
+                                    pair_values["pair_03"],
+                                "pair_12":
+                                    pair_values["pair_12"],
+                                "pair_13":
+                                    pair_values["pair_13"],
+                                "pair_23":
+                                    pair_values["pair_23"],
+                                "balance_loss":
+                                    balance,
+                            }
+                        )
+
+        # ---------------- balance_loss.csv ----------------
+        if (
+            raw_moe_balance_loss is not None
+            or weighted_moe_balance_loss is not None
+        ):
+            balance_file = save_dir / "balance_loss.csv"
+            balance_exists = balance_file.exists()
+
+            with balance_file.open(
+                "a", newline="", encoding="utf-8"
+            ) as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "step",
+                        "variant",
+                        "balance_loss",
+                        "weighted_balance_loss",
+                    ],
+                )
+                if not balance_exists:
+                    writer.writeheader()
+
+                writer.writerow(
+                    {
+                        "step":
+                            self._moe_debug_step,
+                        "variant":
+                            variant,
+                        "balance_loss":
+                            self._moe_to_float(
+                                raw_moe_balance_loss
+                            ),
+                        "weighted_balance_loss":
+                            self._moe_to_float(
+                                weighted_moe_balance_loss
+                            ),
+                    }
+                )
+
 
 
 class v8SegmentationLoss(v8DetectionLoss):
@@ -730,29 +1248,41 @@ class v8ClassificationLoss:
 class v8OBBLoss(v8DetectionLoss):
     def __init__(self, model):
         """
-        Initializes v8OBBLoss with model, assigner, and rotated bbox loss.
+        Initialize OBB-specific criterion components.
 
-        Note model must be de-paralleled.
+        Frequency-MoE auxiliary loss/debug is inherited from
+        v8DetectionLoss and is no longer duplicated here.
         """
         super().__init__(model)
-        self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = RotatedBboxLoss(self.reg_max - 1, use_dfl=self.use_dfl).to(self.device)
 
-        self.model = model
+        self.assigner = RotatedTaskAlignedAssigner(
+            topk=10,
+            num_classes=self.nc,
+            alpha=0.5,
+            beta=6.0,
+        )
+        self.bbox_loss = RotatedBboxLoss(
+            self.reg_max - 1,
+            use_dfl=self.use_dfl,
+        ).to(self.device)
+
+        # ---------------- OBB-only mask auxiliary branch ----------------
         self.mask_loss_gain = 0.05
         self.mask_eta = 0.35
         self.mask_loss_enable = False
-        # -------- mask visualization --------
+
         self.mask_vis_enable = False
-        self.mask_vis_interval = 5000       # 每 500 iter 保存一次
+        self.mask_vis_interval = 5000
         self.mask_vis_dir = Path("runs/maskv1_debug")
-        self.mask_vis_max_layers = 3       # P3/P4/P5
+        self.mask_vis_max_layers = 3
         self._mask_vis_step = 0
-        # 额外增加一个总 debug 开关
         self.mask_debug_print = False
-        for m in self.model.modules():
-            if hasattr(m, "cache_aux_mask_logits"):
-                m.cache_aux_mask_logits = bool(self.mask_loss_enable)
+
+        for module in self.model.modules():
+            if hasattr(module, "cache_aux_mask_logits"):
+                module.cache_aux_mask_logits = bool(
+                    self.mask_loss_enable
+                )
 
     def _clear_aux_mask_logits(self):
         for m in self.model.modules():
@@ -990,6 +1520,7 @@ class v8OBBLoss(v8DetectionLoss):
 
             print(" | ".join(msg))
 
+
     def __call__(self, preds, batch):
         """Calculate and return the loss for the YOLO model."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
@@ -1061,13 +1592,17 @@ class v8OBBLoss(v8DetectionLoss):
         loss[2] *= self.hyp.dfl  # dfl gain
 
         total_loss = loss.sum()
+
         if self.mask_loss_enable:
             aux_mask_loss = self._compute_aux_mask_loss(batch)
             if aux_mask_loss is not None:
                 total_loss = total_loss + self.mask_loss_gain * aux_mask_loss
 
-        # return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
-        return total_loss * batch_size, loss.detach()  # loss(box, cls, dfl, aux_mask)
+        # Generic Frequency-MoE auxiliary loss/debug inherited from parent.
+        total_loss = self._apply_moe_aux(
+            total_loss
+        )
+        return total_loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
     def bbox_decode(self, anchor_points, pred_dist, pred_angle):
         """

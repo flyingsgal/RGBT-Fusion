@@ -1,7 +1,7 @@
 # 查看模型信息
 
 from ultralytics import YOLO
-model = YOLO('/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/offset/IRGuidedSelectiveOffset_P3.yaml')
+model = YOLO('/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/frequency/FreqCoupledWavelet_parallel.yaml')
 model.info()
 
 # from ultralytics import YOLO

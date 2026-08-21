@@ -78,7 +78,6 @@ def build_model(model_path: str):
 
 def train_once(args, batch_size):
     model = build_model(args.model)
-
     train_kwargs = dict(
         data=args.data,
         epochs=args.epochs,
@@ -102,6 +101,7 @@ def train_once(args, batch_size):
         plots=True,
         save=True,
         val=True,
+        iou=0.5,
     )
 
     # 可选参数：resume
@@ -163,20 +163,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Robust Ultralytics YOLO Training Script")
 
     parser.add_argument("--model", type=str,
-                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/mamba/TSCIv4SharedWindowMambaFusion.yaml",
+                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/yaml/frequency/FreqCoupledWavelet_parallel.yaml",
                         help="模型结构 yaml 或权重 pt 路径")
     parser.add_argument("--data", type=str,
-                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/data/dronevehicle.yaml",
+                        default="/storage/jyx4/projects/TwoStream_Yolov8-main/data/M3FD.yaml",
                         help="数据集 yaml 路径")
 
-    parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--imgsz", type=int, default=768)
+    parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--workers", type=int, default=8)
 
-    parser.add_argument("--project", type=str, default="runs/dronevehicle/mamba")
-    parser.add_argument("--name", type=str, default="TSCIv4_1SharedWindowMambaFusion")
+    parser.add_argument("--project", type=str, default="runs/M3FD")
+    parser.add_argument("--name", type=str, default="FreqCoupledWavelet_parallel")
     parser.add_argument("--exist-ok", action="store_true")
 
     parser.add_argument("--resume", action="store_true")

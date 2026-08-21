@@ -113,6 +113,15 @@ from ultralytics.nn.modules import (
     LASCIModulev2,
     LASCIModulev3,
     IRGuidedSelectiveOffset,
+    ProgressiveSCI, 
+    SCISelect, 
+    SCIPairFuse,
+    FRCSFModule,
+    FreqMoERouterSpecific,
+    FreqMoEFullIndependent,
+    FreqMoEFullIndependentV2,
+    FreqMoEFullIndependentV2Residual,
+    FreqCoupledWaveletFusion,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1444,6 +1453,30 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
 
             # 不在 YAML 里写 c，自动由 rgb/ir 特征层推导
             args = [c1, *args]
+        elif m is FRCSFModule:
+            # FRCSFModule: [rgb_feature, ir_feature] -> single fused feature.
+            # Channel c is inferred from the two input layers; do NOT write c in YAML args.
+            assert isinstance(f, list) and len(f) == 2, \
+                f"FRCSFModule expects [rgb_feat, ir_feat], got f={f}"
+
+            c_rgb, c_ir = ch[f[0]], ch[f[1]]
+            assert c_rgb == c_ir, \
+                f"FRCSFModule channel mismatch: rgb={c_rgb}, ir={c_ir}"
+
+            c2 = c_rgb
+            args = [c_rgb, *args]
+        elif m in {FreqMoERouterSpecific, FreqMoEFullIndependent,FreqMoEFullIndependentV2,FreqMoEFullIndependentV2Residual,FreqCoupledWaveletFusion}:
+            # Input: [rgb_feat, ir_feat]
+            # YAML args do NOT contain channel c. Actual c is inferred here.
+            assert isinstance(f, list) and len(f) == 2, \
+                f"{m.__name__} expects [rgb, ir], got f={f}"
+
+            c1a, c1b = ch[f[0]], ch[f[1]]
+            assert c1a == c1b, \
+                f"{m.__name__} channel mismatch: rgb={c1a}, ir={c1b}"
+
+            c2 = c1a
+            args = [c2, *args]
         #####IR引导模块####################################
         elif m is IRPromptRGB:
             # 输入是双流 tuple，输出仍然是双流 tuple
@@ -1478,7 +1511,51 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             #     assert len(f) == 2, f"ADD expects 2 inputs when f is list, got f={f}"
             #     c2 = ch[f[0]]
             # else:
-            #     c2 = ch[f] 
+            #     c2 = ch[f]
+        elif m is ProgressiveSCI:
+            # YAML 示例：
+            # - [[rgb_idx, ir_idx, raw_rgb_idx], 1, ProgressiveSCI,
+            #    [embed_dim, 3, 5, heads, max_iters, relation_dim, tau, lambda_low]]
+            if not isinstance(f, list) or len(f) < 2:
+                raise ValueError(
+                    "ProgressiveSCI requires a list input: [rgb_layer, ir_layer, optional_raw_rgb_layer]"
+                )
+
+            c_rgb = ch[f[0]]
+            c_ir = ch[f[1]]
+            if c_rgb != c_ir:
+                raise ValueError(
+                    f"ProgressiveSCI requires equal RGB/IR channels, got {c_rgb} and {c_ir}"
+                )
+
+            # block.py 中 ProgressiveSCI.__init__ 的第一个参数是输入通道 c。
+            args = [c_rgb, *args]
+            c2 = c_rgb
+
+        elif m is SCISelect:
+            # 输入是 ProgressiveSCI 产生的 (rgb_out, ir_out) 元组。
+            # parse_model 的 ch 只能保存一个整数；由于元组两路通道相同，直接沿用即可。
+            if isinstance(f, list):
+                if len(f) != 1:
+                    raise ValueError("SCISelect expects exactly one pair-producing layer")
+                c2 = ch[f[0]]
+            else:
+                c2 = ch[f]
+
+        elif m is SCIPairFuse:
+            # YAML 示例：
+            # - [pair_layer, 1, SCIPairFuse, [add]]
+            # - [pair_layer, 1, SCIPairFuse, [concat]]
+            if isinstance(f, list):
+                if len(f) != 1:
+                    raise ValueError("SCIPairFuse expects exactly one pair-producing layer")
+                c_pair = ch[f[0]]
+            else:
+                c_pair = ch[f]
+
+            # SCIPairFuse.__init__(c, mode)
+            args = [c_pair, *args]
+            c2 = c_pair
         elif m is S2Attention:
             c1 = ch[f[0]]+ch[f[1]]
             c2 = ch[f[0]]
